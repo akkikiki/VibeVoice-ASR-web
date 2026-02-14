@@ -23,7 +23,7 @@ function DeviceBadge({ device }: { device?: "webgpu" | "wasm" | null }) {
 }
 
 export default function Progress({ status }: ProgressProps) {
-    if (status.status === "ready") return null;
+    if (status.status === "ready" || status.status === "idle") return null;
 
     return (
         <div className="w-full max-w-lg">

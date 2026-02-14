@@ -2,10 +2,12 @@ import { useCallback } from "react";
 import AudioManager from "./components/AudioManager";
 import Transcript from "./components/Transcript";
 import Progress from "./components/Progress";
+import ModelSelector from "./components/ModelSelector";
 import { useTranscriber } from "./hooks/useTranscriber";
 
 function App() {
-    const { status, result, transcribe } = useTranscriber();
+    const { status, result, transcribe, loadModel } = useTranscriber();
+    const isIdle = status.status === "idle";
     const isReady = status.status === "ready";
     const isTranscribing = status.status === "transcribing";
 
@@ -38,17 +40,23 @@ function App() {
             </header>
 
             <main className="flex flex-col items-center gap-6 w-full">
-                <Progress status={status} />
+                {isIdle ? (
+                    <ModelSelector onLoadModel={loadModel} />
+                ) : (
+                    <>
+                        <Progress status={status} />
 
-                <AudioManager
-                    onAudioReady={handleAudioReady}
-                    isTranscribing={!isReady || isTranscribing}
-                />
+                        <AudioManager
+                            onAudioReady={handleAudioReady}
+                            isTranscribing={!isReady || isTranscribing}
+                        />
 
-                <Transcript
-                    result={result}
-                    isTranscribing={isTranscribing}
-                />
+                        <Transcript
+                            result={result}
+                            isTranscribing={isTranscribing}
+                        />
+                    </>
+                )}
             </main>
 
             <footer className="mt-auto pt-8 pb-4 text-center text-xs text-gray-400">

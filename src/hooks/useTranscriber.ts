@@ -1,8 +1,8 @@
 import { useState, useRef, useCallback, useEffect } from "react";
-import { SAMPLE_RATE } from "../utils/Constants";
+import { SAMPLE_RATE, ModelConfig } from "../utils/Constants";
 
 export interface TranscriberProgress {
-    status: "loading" | "downloading" | "ready" | "transcribing" | "error";
+    status: "idle" | "loading" | "downloading" | "ready" | "transcribing" | "error";
     progress?: number;
     file?: string;
     message?: string;
@@ -16,7 +16,7 @@ export interface TranscriberResult {
 
 export function useTranscriber() {
     const [status, setStatus] = useState<TranscriberProgress>({
-        status: "loading",
+        status: "idle",
         device: null,
     });
     const [result, setResult] = useState<TranscriberResult | null>(null);
@@ -116,12 +116,15 @@ export function useTranscriber() {
 
         workerRef.current = worker;
 
-        // Initialize model loading
-        worker.postMessage({ type: "load" });
-
         return () => {
             worker.terminate();
         };
+    }, []);
+
+    const loadModel = useCallback((config: ModelConfig) => {
+        if (!workerRef.current) return;
+        setStatus({ status: "loading", device: null });
+        workerRef.current.postMessage({ type: "load", config });
     }, []);
 
     const transcribe = useCallback((audioData: Float32Array) => {
@@ -138,5 +141,6 @@ export function useTranscriber() {
         status,
         result,
         transcribe,
+        loadModel,
     };
 }
