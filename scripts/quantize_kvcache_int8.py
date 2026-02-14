@@ -1,31 +1,32 @@
 #!/usr/bin/env python3
 """
-Streaming INT8 quantization of the FP32 decoder for VibeVoice-ASR.
+Streaming INT8 quantization of FP32 KV-cache decoder models for VibeVoice-ASR.
 
-Unlike onnxruntime's quantize_dynamic (which loads the full 29 GB model into RAM),
-this script streams tensor data from disk one-at-a-time, keeping memory usage low.
+The KV-cache export produces two models:
+  - decoder_model.onnx          (prefill: no past key/values)
+  - decoder_with_past_model.onnx (decode: with past key/values)
 
-Strategy (mirrors convert_encoder_fp16_v2.py):
-  - Load only the ONNX protobuf (~few MB), NOT the external data
-  - For each FP32 weight used by MatMul nodes:
-      Read from disk → quantize to INT8 → write INT8 data to output
-      Add scale/zero_point initializers + DequantizeLinear node
-  - For embed_tokens: FP32 → FP16 + Cast node (same as before)
-  - For everything else (biases, layer norms): copy as-is
-  - Reshard output into files < 1.9 GB for browser compatibility
+Both share the same weights, stored as individual external data files
+(one file per tensor, e.g. "onnx__MatMul_8041", "language_model.embed_tokens.weight").
 
-Quantization details:
-  - Symmetric per-tensor: scale = max(|w|) / 127, zero_point = 0
-  - INT8 weight = round(w / scale).clip(-128, 127)
-  - DequantizeLinear at runtime: FP32 = (INT8 - 0) * scale
+This script:
+  1. Downloads both .onnx protobufs + all external data files from HuggingFace
+  2. For each model:
+     - Quantize MatMul weights to INT8 (symmetric per-tensor)
+     - Convert embed_tokens to FP16 + Cast node
+     - Copy everything else as-is
+     - Reshard into < 1.9 GB files for browser compatibility
+  3. Output files named for transformers.js convention (dtype "int8" -> suffix "_int8"):
+     - decoder_model_int8.onnx + decoder_model_int8.onnx_data[_N]
+     - decoder_with_past_model_int8.onnx + decoder_with_past_model_int8.onnx_data[_N]
 
 Requirements:
     pip install onnx numpy huggingface_hub
 
 Usage:
-    python quantize_decoder_int8.py                   # local only
-    python quantize_decoder_int8.py --upload           # quantize + upload
-    python quantize_decoder_int8.py --skip-download    # reuse cached files
+    python quantize_kvcache_int8.py                   # local only
+    python quantize_kvcache_int8.py --upload           # quantize + upload
+    python quantize_kvcache_int8.py --skip-download    # reuse cached files
 """
 
 import argparse
@@ -36,25 +37,35 @@ import onnx
 from onnx import TensorProto, helper, numpy_helper
 
 REPO_ID = "akkikiki/VibeVoice-ASR-onnx"
-WORK_DIR = Path("/tmp/vibevoice-split/decoder_int8")
-INPUT_DIR = WORK_DIR / "onnx"
+WORK_DIR = Path("/tmp/vibevoice-split/decoder_kvcache_int8")
+INPUT_DIR = WORK_DIR / "onnx_kvcache"
 OUTPUT_DIR = WORK_DIR / "resharded"
 MAX_SHARD_SIZE = 1_900_000_000  # 1.9 GB
 
-SRC_ONNX = "decoder_with_speech.onnx"
-DST_ONNX = "decoder_model_merged_int8.onnx"
+MODELS = [
+    ("decoder_model.onnx", "decoder_model_int8.onnx"),
+    ("decoder_with_past_model.onnx", "decoder_with_past_model_int8.onnx"),
+]
+
 EMBED_TENSOR_NAME = "language_model.embed_tokens.weight"
 
 
-def download_decoder():
-    """Download the FP32 decoder from HuggingFace."""
-    from huggingface_hub import hf_hub_download
+def download_kvcache():
+    """Download KV-cache decoder files from HuggingFace."""
+    from huggingface_hub import HfApi, hf_hub_download
 
     INPUT_DIR.mkdir(parents=True, exist_ok=True)
-    print("Downloading decoder_with_speech.onnx...")
-    hf_hub_download(REPO_ID, "onnx/decoder_with_speech.onnx", local_dir=WORK_DIR)
-    print("Downloading decoder_with_speech.onnx.data (29 GB)...")
-    hf_hub_download(REPO_ID, "onnx/decoder_with_speech.onnx.data", local_dir=WORK_DIR)
+    api = HfApi()
+
+    # List all files in onnx_kvcache/
+    all_files = api.list_repo_files(REPO_ID)
+    kvcache_files = [f for f in all_files if f.startswith("onnx_kvcache/")]
+
+    print(f"Downloading {len(kvcache_files)} files from onnx_kvcache/...")
+    for i, f in enumerate(kvcache_files):
+        if i % 50 == 0:
+            print(f"  {i}/{len(kvcache_files)}...")
+        hf_hub_download(REPO_ID, f, local_dir=WORK_DIR)
     print("Done!")
 
 
@@ -107,24 +118,27 @@ def quantize_tensor_int8(fp32_bytes):
     return quantized.tobytes(), scale
 
 
-def quantize_streaming():
+def quantize_model(src_onnx_name, dst_onnx_name):
     """
-    Stream through all initializers, quantize MatMul weights to INT8,
-    convert embed_tokens to FP16, copy everything else, and reshard.
+    Stream through all initializers of one model, quantize MatMul weights
+    to INT8, convert embed_tokens to FP16, copy everything else, and reshard.
     """
+    print(f"\n{'='*60}")
+    print(f"Processing: {src_onnx_name} -> {dst_onnx_name}")
+    print(f"{'='*60}")
+
     print("\n=== Loading protobuf (no external data) ===")
-    model = onnx.load(str(INPUT_DIR / SRC_ONNX), load_external_data=False)
+    model = onnx.load(str(INPUT_DIR / src_onnx_name), load_external_data=False)
     src_dir = INPUT_DIR
 
     # --- Identify which initializers are used by MatMul nodes ---
     matmul_weight_names = set()
     for node in model.graph.node:
         if node.op_type == "MatMul":
-            # MatMul has 2 inputs; typically input[1] is the weight initializer
             for inp_name in node.input:
                 matmul_weight_names.add(inp_name)
 
-    # Filter to only those that are actually initializers (not activations)
+    # Filter to only those that are actually initializers
     init_names = {init.name for init in model.graph.initializer}
     matmul_weight_names = matmul_weight_names & init_names
 
@@ -151,16 +165,9 @@ def quantize_streaming():
         print(f"Embedding to FP16: {embed_name}")
 
     # --- Step 1: Modify protobuf for quantized weights ---
-    # For each quantized weight:
-    #   - Rename initializer: {name} -> {name}_quantized (INT8)
-    #   - Add scale initializer: {name}_scale (FP32 scalar)
-    #   - Add zero_point initializer: {name}_zero_point (INT8 scalar)
-    #   - Insert DequantizeLinear node: quantized + scale + zp -> {name}
     print("\n=== Modifying protobuf for INT8 quantization ===")
 
     dequant_nodes = []
-    scale_inits_to_add = []  # (name, will be written inline in protobuf)
-    zp_inits_to_add = []
 
     for name in sorted(quantize_names):
         init = fp32_external_inits[name]
@@ -196,7 +203,6 @@ def quantize_streaming():
                 break
 
         if gather_node:
-            # Update Gather input to use FP16 initializer name
             for idx, inp in enumerate(gather_node.input):
                 if inp == embed_name:
                     gather_node.input[idx] = fp16_name
@@ -215,7 +221,7 @@ def quantize_streaming():
 
             gather_idx = list(model.graph.node).index(gather_node)
             model.graph.node.insert(gather_idx + 1, cast_node)
-            print(f"  Inserted Cast node for embed_tokens: {fp16_output} -> {original_output}")
+            print(f"  Inserted Cast node for embed_tokens")
 
     # Insert all DequantizeLinear nodes at the beginning of the graph
     for i, dq_node in enumerate(dequant_nodes):
@@ -224,13 +230,16 @@ def quantize_streaming():
 
     # --- Step 3: Stream data, quantize, and write to sharded output ---
     print("\n=== Streaming quantization + resharding ===")
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Create output subdirectory per model
+    model_output_dir = OUTPUT_DIR / dst_onnx_name.replace(".onnx", "")
+    model_output_dir.mkdir(parents=True, exist_ok=True)
 
     # Clean output directory
-    for f in OUTPUT_DIR.iterdir():
+    for f in model_output_dir.iterdir():
         f.unlink()
 
-    base_name = DST_ONNX
+    base_name = dst_onnx_name
     shard_idx = 0
     shard_offset = 0
     shard_file = None
@@ -245,12 +254,11 @@ def quantize_streaming():
             shard_idx += 1
         suffix = "" if shard_idx == 0 else f"_{shard_idx}"
         shard_name = f"{base_name}_data{suffix}"
-        shard_path = OUTPUT_DIR / shard_name
+        shard_path = model_output_dir / shard_name
         shard_file = open(shard_path, "wb")
         shard_offset = 0
 
     def write_to_shard(data):
-        """Write data to the current shard, opening a new one if needed."""
         nonlocal shard_offset
         data_len = len(data)
         if shard_offset + data_len > MAX_SHARD_SIZE and shard_offset > 0:
@@ -268,23 +276,18 @@ def quantize_streaming():
     total_fp16_size = 0
     quantized_count = 0
 
-    # Process all initializers in order
     for init in model.graph.initializer:
         info = get_external_info(init)
         if "location" not in info:
-            # Inline initializer (no external data) — skip, it stays in protobuf
             continue
 
-        # Determine the original name before our renaming
         original_name = init.name
         is_quantized = original_name.endswith("_quantized")
         is_fp16_embed = original_name.endswith("_fp16") and original_name.removesuffix("_fp16") == EMBED_TENSOR_NAME
 
-        # Read raw FP32 data from disk
         raw_data = read_tensor_from_disk(src_dir, info)
 
         if is_quantized:
-            # Quantize FP32 -> INT8
             int8_bytes, scale_val = quantize_tensor_int8(raw_data)
             total_fp32_size += len(raw_data)
             total_int8_size += len(int8_bytes)
@@ -293,11 +296,9 @@ def quantize_streaming():
             if quantized_count % 50 == 0:
                 print(f"  Quantized {quantized_count} tensors...")
 
-            # Write INT8 weight data to shard
             loc, off, length = write_to_shard(int8_bytes)
             set_external_data(init, loc, off, length)
 
-            # Create scale initializer (inline in protobuf — it's just 4 bytes)
             base_weight_name = original_name.removesuffix("_quantized")
             scale_init = numpy_helper.from_array(
                 np.array(scale_val, dtype=np.float32),
@@ -305,7 +306,6 @@ def quantize_streaming():
             )
             model.graph.initializer.append(scale_init)
 
-            # Create zero_point initializer (inline — 1 byte)
             zp_init = numpy_helper.from_array(
                 np.array(0, dtype=np.int8),
                 name=base_weight_name + "_zero_point",
@@ -313,7 +313,6 @@ def quantize_streaming():
             model.graph.initializer.append(zp_init)
 
         elif is_fp16_embed:
-            # Convert FP32 -> FP16
             arr = np.frombuffer(raw_data, dtype=np.float32)
             fp16_bytes = arr.astype(np.float16).tobytes()
             total_fp32_size += len(raw_data)
@@ -324,7 +323,6 @@ def quantize_streaming():
             set_external_data(init, loc, off, length)
 
         else:
-            # Copy as-is (biases, layer norms, non-FP32, etc.)
             loc, off, length = write_to_shard(raw_data)
             set_external_data(init, loc, off, length)
 
@@ -342,42 +340,43 @@ def quantize_streaming():
     print(f"  Created {num_shards} shards")
 
     # Save ONNX protobuf
-    out_onnx = OUTPUT_DIR / DST_ONNX
+    out_onnx = model_output_dir / dst_onnx_name
     onnx.save(model, str(out_onnx))
     print(f"  Saved {out_onnx.name}")
 
     # Print summary
-    print(f"\nAll files in {OUTPUT_DIR}:")
+    print(f"\nAll files in {model_output_dir}:")
     total = 0
-    for f in sorted(OUTPUT_DIR.iterdir()):
+    for f in sorted(model_output_dir.iterdir()):
         size_mb = f.stat().st_size / (1024 ** 2)
         total += size_mb
         print(f"  {f.name}: {size_mb:.1f} MB")
     print(f"  Total: {total / 1024:.2f} GB")
 
-    return OUTPUT_DIR, num_shards
+    return model_output_dir, num_shards
 
 
-def upload(output_dir: Path):
-    """Upload to HuggingFace."""
+def upload(output_dirs):
+    """Upload all quantized models to HuggingFace."""
     print("\n=== Upload ===")
     from huggingface_hub import HfApi
     api = HfApi()
 
-    for f in sorted(output_dir.iterdir()):
-        remote_path = f"onnx/{f.name}"
-        print(f"Uploading {f.name} ({f.stat().st_size / (1024**2):.1f} MB) -> {remote_path}...")
-        api.upload_file(
-            path_or_fileobj=str(f),
-            path_in_repo=remote_path,
-            repo_id=REPO_ID,
-        )
+    for output_dir in output_dirs:
+        for f in sorted(output_dir.iterdir()):
+            remote_path = f"onnx/{f.name}"
+            print(f"Uploading {f.name} ({f.stat().st_size / (1024**2):.1f} MB) -> {remote_path}...")
+            api.upload_file(
+                path_or_fileobj=str(f),
+                path_in_repo=remote_path,
+                repo_id=REPO_ID,
+            )
     print("Upload complete!")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Streaming INT8 quantization of VibeVoice-ASR decoder",
+        description="Streaming INT8 quantization of VibeVoice-ASR KV-cache decoder models",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--upload", action="store_true", help="Upload results to HuggingFace")
@@ -385,15 +384,18 @@ def main():
     args = parser.parse_args()
 
     if not args.skip_download:
-        download_decoder()
+        download_kvcache()
 
-    output_dir, num_shards = quantize_streaming()
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_dirs = []
 
-    print(f"\n*** Update worker.js: decoder_model_merged dtype to 'q8', shards to {num_shards} ***")
-    print(f"*** Update HF config.json: decoder_model_merged dtype to 'q8', shards to {num_shards} ***")
+    for src_name, dst_name in MODELS:
+        out_dir, num_shards = quantize_model(src_name, dst_name)
+        output_dirs.append(out_dir)
+        print(f"\n*** {dst_name}: {num_shards} shards ***")
 
     if args.upload:
-        upload(output_dir)
+        upload(output_dirs)
     else:
         print("\nTo upload, run again with --upload flag.")
 
