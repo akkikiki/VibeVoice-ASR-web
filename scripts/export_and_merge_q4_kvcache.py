@@ -81,8 +81,11 @@ def load_qwen2_decoder():
     print(f"  Downloaded to: {model_dir}")
 
     # Create model in bf16 to save memory (~14 GB instead of ~28 GB)
-    print("Creating Qwen2ForCausalLM in bf16...")
+    # Use eager attention (not SDPA) so torch.onnx.export works without
+    # hitting the "GuardOnDataDependentSymNode" error in SDPA's conditional.
+    print("Creating Qwen2ForCausalLM in bf16 (eager attention)...")
     qwen2_config.torch_dtype = torch.bfloat16
+    qwen2_config._attn_implementation = "eager"
     model = Qwen2ForCausalLM(qwen2_config).to(torch.bfloat16)
 
     # Load weights shard by shard, remapping "model.language_model.*" -> "model.*"
@@ -149,7 +152,9 @@ class PrefillWrapper(nn.Module):
             inputs_embeds[:, 1 + speech_len:, :],
         ], dim=1)
 
-        position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
+        # Position IDs must match actual sequence length after speech insertion
+        actual_seq_len = inputs_embeds.shape[1]
+        position_ids = torch.arange(actual_seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
 
         outputs = self.model(
             inputs_embeds=inputs_embeds,
@@ -216,8 +221,15 @@ class DecodeWithPastWrapper(nn.Module):
         new_past_kv = outputs.past_key_values
         present_tensors = []
         for i in range(NUM_HIDDEN_LAYERS):
-            present_tensors.append(new_past_kv.layers[i].keys)
-            present_tensors.append(new_past_kv.layers[i].values)
+            if hasattr(new_past_kv, 'key_cache'):
+                present_tensors.append(new_past_kv.key_cache[i])
+                present_tensors.append(new_past_kv.value_cache[i])
+            elif hasattr(new_past_kv, 'layers'):
+                present_tensors.append(new_past_kv.layers[i].keys)
+                present_tensors.append(new_past_kv.layers[i].values)
+            else:
+                present_tensors.append(new_past_kv[i][0])
+                present_tensors.append(new_past_kv[i][1])
 
         return (logits, *present_tensors)
 
@@ -264,6 +276,7 @@ def export_onnx(model):
             input_names=input_names, output_names=output_names,
             dynamic_axes=dynamic_axes, opset_version=17,
             do_constant_folding=True, export_params=True,
+            dynamo=False,  # Use legacy tracer-based exporter
         )
     print(f"  Saved: {prefill_path} ({prefill_path.stat().st_size / 1e6:.1f} MB)")
     del prefill
@@ -303,6 +316,7 @@ def export_onnx(model):
             input_names=input_names_d, output_names=output_names_d,
             dynamic_axes=dynamic_axes_d, opset_version=17,
             do_constant_folding=True, export_params=True,
+            dynamo=False,  # Use legacy tracer-based exporter
         )
     print(f"  Saved: {decode_path} ({decode_path.stat().st_size / 1e6:.1f} MB)")
     del decode

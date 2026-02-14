@@ -35,10 +35,6 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-# Register VibeVoice ASR model types with transformers
-from vibevoice.modular.modeling_vibevoice_asr import VibeVoiceASRConfig  # noqa: F401
-from transformers import AutoConfig
-AutoConfig.register("vibevoice", VibeVoiceASRConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -82,11 +78,11 @@ class DecoderPrefillWrapper(nn.Module):
 
     def __init__(self, model):
         super().__init__()
-        # Extract the Qwen2 language model and lm_head from the VibeVoice wrapper.
-        # Structure: model.model.language_model = Qwen2Model, model.lm_head = Linear
-        self.language_model = model.model.language_model
-        self.lm_head = model.lm_head
-        self.embed_tokens = self.language_model.embed_tokens
+        # Extract the Qwen2 language model from the VibeVoice wrapper.
+        # The attribute name depends on the model implementation; common names
+        # include 'language_model', 'decoder', or 'model'.
+        self.language_model = model.language_model
+        self.embed_tokens = self.language_model.model.embed_tokens
 
     def forward(self, input_ids, speech_embeddings):
         """
@@ -118,12 +114,12 @@ class DecoderPrefillWrapper(nn.Module):
         ], dim=1)
 
         # Step 3: Build a causal attention mask and position IDs
-        # The Qwen2 model internally handles causal masking when we pass
-        # inputs_embeds and no explicit attention_mask, but we provide
-        # position_ids for correctness.
-        position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
+        # Position IDs must match actual sequence length after speech insertion,
+        # NOT the original input_ids length (which may be shorter than speech_len).
+        actual_seq_len = inputs_embeds.shape[1]
+        position_ids = torch.arange(actual_seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
 
-        # Step 4: Run the Qwen2 decoder (Qwen2Model returns last_hidden_state)
+        # Step 4: Run the Qwen2 decoder
         outputs = self.language_model(
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
@@ -132,21 +128,16 @@ class DecoderPrefillWrapper(nn.Module):
             return_dict=True,
         )
 
-        # Step 4b: Apply lm_head to get logits
-        logits = self.lm_head(outputs.last_hidden_state)  # [batch, seq_len, vocab_size]
+        logits = outputs.logits  # [batch, seq_len, vocab_size]
 
         # Step 5: Extract KV-cache tensors.
-        # outputs.past_key_values is a DynamicCache with .layers list.
-        # Each layer has .keys and .values attributes.
+        # outputs.past_key_values is a tuple of (key, value) per layer.
+        # For DynamicCache (transformers >= 4.36), we access key_cache / value_cache.
         past_kv = outputs.past_key_values
         present_tensors = []
         for i in range(NUM_HIDDEN_LAYERS):
-            if hasattr(past_kv, 'layers'):
-                # DynamicCache format (transformers >= 4.57)
-                present_tensors.append(past_kv.layers[i].keys)
-                present_tensors.append(past_kv.layers[i].values)
-            elif hasattr(past_kv, 'key_cache'):
-                # DynamicCache format (transformers 4.36-4.56)
+            if hasattr(past_kv, 'key_cache'):
+                # DynamicCache format (transformers >= 4.36)
                 present_tensors.append(past_kv.key_cache[i])
                 present_tensors.append(past_kv.value_cache[i])
             else:
@@ -178,9 +169,8 @@ class DecoderWithPastWrapper(nn.Module):
 
     def __init__(self, model):
         super().__init__()
-        self.language_model = model.model.language_model
-        self.lm_head = model.lm_head
-        self.embed_tokens = self.language_model.embed_tokens
+        self.language_model = model.language_model
+        self.embed_tokens = self.language_model.model.embed_tokens
 
     def forward(self, input_ids, *past_key_values_flat):
         """
@@ -197,13 +187,25 @@ class DecoderWithPastWrapper(nn.Module):
         batch_size = input_ids.shape[0]
 
         # Reconstruct the past_key_values structure expected by Qwen2.
-        from transformers.cache_utils import DynamicCache
-        past_kv = DynamicCache()
-        for i in range(NUM_HIDDEN_LAYERS):
-            key = past_key_values_flat[2 * i]
-            value = past_key_values_flat[2 * i + 1]
-            # Use update() to populate each layer's cache
-            past_kv.update(key, value, layer_idx=i)
+        # We use DynamicCache if available, otherwise fall back to tuple format.
+        try:
+            from transformers.cache_utils import DynamicCache
+            past_kv = DynamicCache()
+            for i in range(NUM_HIDDEN_LAYERS):
+                key = past_key_values_flat[2 * i]
+                value = past_key_values_flat[2 * i + 1]
+                # DynamicCache.update() appends to existing cache, but we want
+                # to set the full cache. We directly assign to the internal lists.
+                past_kv.key_cache.append(key)
+                past_kv.value_cache.append(value)
+            # Set the seen tokens count so position_ids are computed correctly
+            past_kv._seen_tokens = past_key_values_flat[0].shape[2]
+        except ImportError:
+            # Fall back to legacy tuple format
+            past_kv = tuple(
+                (past_key_values_flat[2 * i], past_key_values_flat[2 * i + 1])
+                for i in range(NUM_HIDDEN_LAYERS)
+            )
 
         # Compute position IDs: the new token position = past sequence length
         past_len = past_key_values_flat[0].shape[2]  # [batch, heads, past_len, head_dim]
@@ -212,7 +214,7 @@ class DecoderWithPastWrapper(nn.Module):
         # Embed the single new token
         inputs_embeds = self.embed_tokens(input_ids)  # [batch, 1, hidden_size]
 
-        # Run decoder with cache (Qwen2Model returns last_hidden_state)
+        # Run decoder with cache
         outputs = self.language_model(
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
@@ -221,17 +223,13 @@ class DecoderWithPastWrapper(nn.Module):
             return_dict=True,
         )
 
-        # Apply lm_head to get logits
-        logits = self.lm_head(outputs.last_hidden_state)  # [batch, 1, vocab_size]
+        logits = outputs.logits  # [batch, 1, vocab_size]
 
         # Extract updated KV-cache
         new_past_kv = outputs.past_key_values
         present_tensors = []
         for i in range(NUM_HIDDEN_LAYERS):
-            if hasattr(new_past_kv, 'layers'):
-                present_tensors.append(new_past_kv.layers[i].keys)
-                present_tensors.append(new_past_kv.layers[i].values)
-            elif hasattr(new_past_kv, 'key_cache'):
+            if hasattr(new_past_kv, 'key_cache'):
                 present_tensors.append(new_past_kv.key_cache[i])
                 present_tensors.append(new_past_kv.value_cache[i])
             else:
@@ -309,23 +307,29 @@ def load_model(dtype_str: str, device: str):
         device: "cpu" or "cuda"
 
     Returns:
-        The loaded model instance.
+        The loaded model instance in fp32 (for correct ONNX export).
     """
     from transformers import AutoModelForCausalLM, AutoConfig
 
-    torch_dtype = torch.bfloat16 if dtype_str == "bf16" else torch.float32
+    # Always load in bf16 first to save memory (~14 GB), then convert to fp32
+    # for ONNX export. Direct fp32 loading would need ~28 GB.
+    load_dtype = torch.bfloat16
 
-    print(f"Loading model {MODEL_ID} with dtype={torch_dtype} on device={device}...")
-    print("  (This may take a few minutes and ~14 GB of memory in bf16)")
+    print(f"Loading model {MODEL_ID} with dtype=bf16 on device={device}...")
+    print("  (Loading in bf16 first, then converting to fp32 for export)")
 
     # VibeVoice-ASR uses custom code, so trust_remote_code is required.
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
-        dtype=torch_dtype,
+        torch_dtype=load_dtype,
         trust_remote_code=True,
         device_map=device,
-        attn_implementation="eager",
     )
+
+    if dtype_str == "fp32":
+        print("  Converting model to fp32...")
+        model = model.float()
+
     model.eval()
     print(f"Model loaded successfully. Type: {type(model).__name__}")
     return model
@@ -382,7 +386,6 @@ def export_prefill(model, output_dir: Path, device: str, export_dtype: torch.dty
             opset_version=17,
             do_constant_folding=True,
             export_params=True,
-            dynamo=False,
         )
 
     size_mb = output_path.stat().st_size / (1024 ** 2)
@@ -450,7 +453,6 @@ def export_decode_with_past(model, output_dir: Path, device: str, export_dtype: 
             opset_version=17,
             do_constant_folding=True,
             export_params=True,
-            dynamo=False,
         )
 
     size_mb = output_path.stat().st_size / (1024 ** 2)
