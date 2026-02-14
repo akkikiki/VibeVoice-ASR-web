@@ -65,8 +65,31 @@ class VibeVoiceASRModel {
  */
 async function loadModel() {
     try {
+        // Check WebGPU availability — this model is too large (~6.7GB) for WASM
+        let adapter = null;
+        if (typeof navigator !== "undefined" && navigator.gpu) {
+            try {
+                adapter = await navigator.gpu.requestAdapter();
+            } catch (e) {
+                console.warn("[worker] WebGPU adapter request failed:", e);
+            }
+        }
+
+        if (!adapter) {
+            throw new Error(
+                "WebGPU is not available in this browser. " +
+                "This model requires WebGPU for inference. " +
+                "Please use Chrome 113+ or Edge 113+ with WebGPU enabled, " +
+                "or enable the flag chrome://flags/#enable-unsafe-webgpu"
+            );
+        }
+
+        // Check fp16 support — fall back to q4 (fp32 exceeds WebGPU buffer size limit)
+        const supportsFp16 = adapter.features.has("shader-f16");
+        const encoderDtype = supportsFp16 ? "fp16" : "q4";
+        console.log(`[worker] WebGPU adapter found, shader-f16: ${supportsFp16}, encoder dtype: ${encoderDtype}`);
+
         device = "webgpu";
-        console.log(`[worker] Using device: ${device}`);
 
         self.postMessage({
             type: "device_info",
@@ -78,13 +101,10 @@ async function loadModel() {
         tokenizer = await AutoTokenizer.from_pretrained(MODEL_ID);
         console.log("[worker] Tokenizer loaded");
 
-        // Load model with transformers.js v4
-        // This handles downloading, caching, sharding, and WebGPU session creation
-        console.log(`[worker] Loading model from ${MODEL_ID}...`);
-        const model = await VibeVoiceASRModel.from_pretrained(MODEL_ID, {
+        const modelOptions = {
             device: "webgpu",
             dtype: {
-                encoder_model: "fp16",
+                encoder_model: encoderDtype,
                 decoder_model_merged: "q4",
             },
             use_external_data_format: {
@@ -103,14 +123,17 @@ async function loadModel() {
                         },
                     });
                 } else if (p.status === "done") {
-                    // File download complete — after all files, session creation begins
                     self.postMessage({
                         type: "loading_status",
                         data: { message: "Creating WebGPU session..." },
                     });
                 }
             },
-        });
+        };
+
+        // Load model with transformers.js v4
+        console.log(`[worker] Loading model from ${MODEL_ID}...`);
+        const model = await VibeVoiceASRModel.from_pretrained(MODEL_ID, modelOptions);
 
         speechEncoderSession = model.speechEncoderSession;
         decoderSession = model.decoderSession;
@@ -131,8 +154,7 @@ async function loadModel() {
         self.postMessage({
             type: "error",
             data: {
-                message: `WebGPU model loading failed: ${msg}. ` +
-                    `Try using a browser with WebGPU support (Chrome 113+).`,
+                message: `Model loading failed: ${msg}`,
             },
         });
     }
