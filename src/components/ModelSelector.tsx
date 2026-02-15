@@ -27,7 +27,7 @@ function isMobileDevice(): boolean {
 
 export default function ModelSelector({ onLoadModel }: ModelSelectorProps) {
     const [decodeMode, setDecodeMode] = useState<DecodeMode>("kvcache");
-    const [dtype, setDType] = useState<DType>("int8");
+    const [dtype, setDType] = useState<DType>("q4");
     const [isMobile, setIsMobile] = useState(false);
 
     useEffect(() => {
