@@ -138,7 +138,7 @@ class PrefillWrapper(nn.Module):
         self.model = model.model  # Qwen2Model
         self.lm_head = model.lm_head
 
-    def forward(self, input_ids, speech_embeddings, attention_mask):
+    def forward(self, input_ids, speech_embeddings):
         batch_size, seq_len = input_ids.shape
         speech_len = speech_embeddings.shape[1]
 
@@ -158,7 +158,6 @@ class PrefillWrapper(nn.Module):
 
         outputs = self.model(
             inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=None,
             use_cache=True,
@@ -192,7 +191,7 @@ class DecodeWithPastWrapper(nn.Module):
         self.model = model.model
         self.lm_head = model.lm_head
 
-    def forward(self, input_ids, attention_mask, *past_key_values_flat):
+    def forward(self, input_ids, *past_key_values_flat):
         batch_size = input_ids.shape[0]
 
         from transformers.cache_utils import DynamicCache
@@ -211,7 +210,6 @@ class DecodeWithPastWrapper(nn.Module):
 
         outputs = self.model(
             inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_kv,
             use_cache=True,
@@ -236,6 +234,144 @@ class DecodeWithPastWrapper(nn.Module):
         return (logits, *present_tensors)
 
 
+def _fix_causal_mask_constants(model_proto, traced_seq_len, source_input, source_dim,
+                                add_offset=0):
+    """Replace hardcoded seq_len constants in causal mask with dynamic computations.
+
+    During torch.onnx.export, Qwen2's _update_causal_mask bakes the traced
+    seq_len into Constant nodes for Reshape/Equal/Where ops. This function
+    finds those constants and replaces them with dynamic shape computations
+    by extracting a dimension from a specified input tensor.
+
+    Args:
+        model_proto: The ONNX model protobuf.
+        traced_seq_len: The hardcoded value to replace (e.g. 10 for seq_len).
+        source_input: Name of the input tensor to derive dynamic value from
+                      (e.g. "input_ids" or "past_key_values.0.key").
+        source_dim: Which dimension to extract (e.g. 1 for seq_len, 2 for past_len).
+        add_offset: Constant to add to the extracted dim (e.g. 1 for total_len = past_len + 1).
+    """
+    import numpy as np
+
+    # Find Constant nodes with hardcoded traced_seq_len
+    constants_to_fix = []
+    for node in model_proto.graph.node:
+        if node.op_type == "Constant":
+            for attr in node.attribute:
+                if attr.t and attr.t.data_type == 7:  # int64
+                    if attr.t.raw_data:
+                        arr = np.frombuffer(attr.t.raw_data, dtype=np.int64)
+                    else:
+                        arr = np.array(attr.t.int64_data, dtype=np.int64)
+                    if len(arr) > 0 and traced_seq_len in arr:
+                        constants_to_fix.append((node, list(arr)))
+
+    if not constants_to_fix:
+        print(f"  No hardcoded constants with value {traced_seq_len} found")
+        return
+
+    print(f"  Fixing {len(constants_to_fix)} hardcoded seq_len={traced_seq_len} constants")
+
+    # Create Shape → Gather to extract the dynamic dimension from source_input
+    tag = f"_fix_{traced_seq_len}"
+    shape_out = f"{tag}_shape"
+    gather_out = f"{tag}_dim"
+    dim_idx_name = f"{tag}_dim_idx"
+
+    shape_node = helper.make_node(
+        "Shape", inputs=[source_input], outputs=[shape_out],
+        name=f"{tag}/Shape",
+    )
+    dim_idx_init = numpy_helper.from_array(
+        np.array(source_dim, dtype=np.int64), name=dim_idx_name
+    )
+    gather_node = helper.make_node(
+        "Gather", inputs=[shape_out, dim_idx_name], outputs=[gather_out],
+        name=f"{tag}/Gather", axis=0,
+    )
+    model_proto.graph.initializer.append(dim_idx_init)
+    nodes_to_add = [shape_node, gather_node]
+
+    # If add_offset > 0, add it to the gathered dimension (e.g. total_len = past_len + 1)
+    dynamic_scalar = gather_out
+    if add_offset != 0:
+        offset_name = f"{tag}_offset"
+        add_out = f"{tag}_added"
+        offset_init = numpy_helper.from_array(
+            np.array(add_offset, dtype=np.int64), name=offset_name
+        )
+        add_node = helper.make_node(
+            "Add", inputs=[gather_out, offset_name], outputs=[add_out],
+            name=f"{tag}/Add",
+        )
+        model_proto.graph.initializer.append(offset_init)
+        nodes_to_add.append(add_node)
+        dynamic_scalar = add_out
+
+    # Reshape scalar to [1] tensor for use with Concat
+    seq_len_1d_name = f"{tag}_1d"
+    shape_1_name = f"{tag}_shape_1"
+    reshape_node = helper.make_node(
+        "Reshape", inputs=[dynamic_scalar, shape_1_name], outputs=[seq_len_1d_name],
+        name=f"{tag}/Reshape_1d",
+    )
+    shape_1_init = numpy_helper.from_array(
+        np.array([1], dtype=np.int64), name=shape_1_name
+    )
+    model_proto.graph.initializer.append(shape_1_init)
+    nodes_to_add.append(reshape_node)
+
+    print(f"  Dynamic source: Shape({source_input})[{source_dim}]"
+          + (f" + {add_offset}" if add_offset else "")
+          + f" → {seq_len_1d_name}")
+
+    for i, (const_node, arr) in enumerate(constants_to_fix):
+        out_name = const_node.output[0]
+
+        # Build dynamic shape by replacing traced_seq_len with seq_len_1d
+        # e.g. [10, 1] → Concat([seq_len_1d, [1]])
+        # e.g. [1, 10, 10] → Concat([[1], seq_len_1d, seq_len_1d])
+        concat_inputs = []
+        static_parts = []
+
+        for val in arr:
+            if val == traced_seq_len:
+                if static_parts:
+                    static_name = f"{tag}_static_{i}_{len(concat_inputs)}"
+                    static_init = numpy_helper.from_array(
+                        np.array(static_parts, dtype=np.int64), name=static_name
+                    )
+                    model_proto.graph.initializer.append(static_init)
+                    concat_inputs.append(static_name)
+                    static_parts = []
+                concat_inputs.append(seq_len_1d_name)
+            else:
+                static_parts.append(val)
+
+        if static_parts:
+            static_name = f"{tag}_static_{i}_{len(concat_inputs)}"
+            static_init = numpy_helper.from_array(
+                np.array(static_parts, dtype=np.int64), name=static_name
+            )
+            model_proto.graph.initializer.append(static_init)
+            concat_inputs.append(static_name)
+
+        # Replace the Constant node with a Concat node producing the same output
+        concat_node = helper.make_node(
+            "Concat", inputs=concat_inputs, outputs=[out_name],
+            name=f"{tag}/Concat_{i}", axis=0,
+        )
+        nodes_to_add.append(concat_node)
+
+        # Remove the old Constant node
+        model_proto.graph.node.remove(const_node)
+        print(f"    {const_node.name}: {arr} → dynamic")
+
+    # Insert fixup nodes at the beginning
+    for j, node in enumerate(nodes_to_add):
+        model_proto.graph.node.insert(j, node)
+
+
 def export_onnx(model):
     """Export prefill + decode-with-past ONNX models."""
     print("\n" + "=" * 60)
@@ -253,14 +389,12 @@ def export_onnx(model):
     model_dtype = next(model.parameters()).dtype
     dummy_ids = torch.randint(0, VOCAB_SIZE, (batch_size, seq_len))
     dummy_speech = torch.randn(batch_size, speech_len, HIDDEN_SIZE, dtype=model_dtype)
-    dummy_attn_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
 
-    input_names = ["input_ids", "speech_embeddings", "attention_mask"]
+    input_names = ["input_ids", "speech_embeddings"]
     output_names = ["logits"]
     dynamic_axes = {
         "input_ids": {0: "batch_size", 1: "seq_len"},
         "speech_embeddings": {0: "batch_size", 1: "speech_len"},
-        "attention_mask": {0: "batch_size", 1: "seq_len"},
         "logits": {0: "batch_size", 1: "seq_len"},
     }
     for i in range(NUM_HIDDEN_LAYERS):
@@ -270,18 +404,26 @@ def export_onnx(model):
 
     # Test forward
     with torch.no_grad():
-        test = prefill(dummy_ids, dummy_speech, dummy_attn_mask)
+        test = prefill(dummy_ids, dummy_speech)
     print(f"  Prefill test OK. logits: {test[0].shape}, KV[0]: {test[1].shape}")
 
     prefill_path = EXPORT_DIR / "decoder_model.onnx"
     with torch.no_grad():
         torch.onnx.export(
-            prefill, (dummy_ids, dummy_speech, dummy_attn_mask), str(prefill_path),
+            prefill, (dummy_ids, dummy_speech), str(prefill_path),
             input_names=input_names, output_names=output_names,
             dynamic_axes=dynamic_axes, opset_version=17,
             do_constant_folding=True, export_params=True,
             dynamo=False,  # Use legacy tracer-based exporter
         )
+    # Fix hardcoded causal mask constants before consolidating
+    print("  Fixing hardcoded causal mask constants...")
+    prefill_proto = onnx.load(str(prefill_path), load_external_data=False)
+    _fix_causal_mask_constants(prefill_proto, traced_seq_len=seq_len,
+                               source_input="input_ids", source_dim=1)
+    onnx.save(prefill_proto, str(prefill_path))
+    del prefill_proto
+
     # Re-save with consolidated external data for merge compatibility
     print("  Consolidating external data...")
     prefill_model = onnx.load(str(prefill_path), load_external_data=True)
@@ -303,21 +445,14 @@ def export_onnx(model):
     model_dtype = next(model.parameters()).dtype
 
     dummy_ids_1 = torch.randint(0, VOCAB_SIZE, (1, 1))
-    # attention_mask covers past + current token: length = past_len + 1
-    past_len = 10
-    dummy_attn_mask_d = torch.ones(1, past_len + 1, dtype=torch.long)
     dummy_past = []
     for _ in range(NUM_HIDDEN_LAYERS):
-        dummy_past.append(torch.randn(1, NUM_KEY_VALUE_HEADS, past_len, HEAD_DIM, dtype=model_dtype))
-        dummy_past.append(torch.randn(1, NUM_KEY_VALUE_HEADS, past_len, HEAD_DIM, dtype=model_dtype))
+        dummy_past.append(torch.randn(1, NUM_KEY_VALUE_HEADS, 10, HEAD_DIM, dtype=model_dtype))
+        dummy_past.append(torch.randn(1, NUM_KEY_VALUE_HEADS, 10, HEAD_DIM, dtype=model_dtype))
 
-    input_names_d = ["input_ids", "attention_mask"]
+    input_names_d = ["input_ids"]
     output_names_d = ["logits"]
-    dynamic_axes_d = {
-        "input_ids": {0: "batch_size"},
-        "attention_mask": {0: "batch_size", 1: "total_len"},
-        "logits": {0: "batch_size"},
-    }
+    dynamic_axes_d = {"input_ids": {0: "batch_size"}, "logits": {0: "batch_size"}}
     for i in range(NUM_HIDDEN_LAYERS):
         input_names_d.extend([f"past_key_values.{i}.key", f"past_key_values.{i}.value"])
         output_names_d.extend([f"present.{i}.key", f"present.{i}.value"])
@@ -327,18 +462,29 @@ def export_onnx(model):
         dynamic_axes_d[f"present.{i}.value"] = {0: "batch_size", 2: "total_len"}
 
     with torch.no_grad():
-        test = decode(dummy_ids_1, dummy_attn_mask_d, *dummy_past)
+        test = decode(dummy_ids_1, *dummy_past)
     print(f"  Decode test OK. logits: {test[0].shape}, KV[0]: {test[1].shape}")
 
     decode_path = EXPORT_DIR / "decoder_with_past_model.onnx"
     with torch.no_grad():
         torch.onnx.export(
-            decode, (dummy_ids_1, dummy_attn_mask_d, *dummy_past), str(decode_path),
+            decode, (dummy_ids_1, *dummy_past), str(decode_path),
             input_names=input_names_d, output_names=output_names_d,
             dynamic_axes=dynamic_axes_d, opset_version=17,
             do_constant_folding=True, export_params=True,
             dynamo=False,  # Use legacy tracer-based exporter
         )
+    # Fix hardcoded causal mask constants (past_len=10 → total_len=11)
+    print("  Fixing hardcoded causal mask constants...")
+    decode_proto = onnx.load(str(decode_path), load_external_data=False)
+    _fix_causal_mask_constants(decode_proto, traced_seq_len=10,
+                               source_input="past_key_values.0.key", source_dim=2)  # past_len
+    _fix_causal_mask_constants(decode_proto, traced_seq_len=11,
+                               source_input="past_key_values.0.key", source_dim=2,
+                               add_offset=1)  # total_len = past_len + 1
+    onnx.save(decode_proto, str(decode_path))
+    del decode_proto
+
     # Re-save with consolidated external data for merge compatibility
     print("  Consolidating external data...")
     decode_model = onnx.load(str(decode_path), load_external_data=True)
