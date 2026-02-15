@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import {
     DecodeMode,
     DType,
@@ -21,15 +21,34 @@ const DTYPE_LABELS: Record<DType, string> = {
     fp16: "FP16 (~15 GB)",
 };
 
+function isMobileDevice(): boolean {
+    return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+}
+
 export default function ModelSelector({ onLoadModel }: ModelSelectorProps) {
     const [decodeMode, setDecodeMode] = useState<DecodeMode>("kvcache");
     const [dtype, setDType] = useState<DType>("int8");
+    const [isMobile, setIsMobile] = useState(false);
+
+    useEffect(() => {
+        setIsMobile(isMobileDevice());
+    }, []);
 
     return (
         <div className="w-full max-w-md bg-white rounded-xl shadow-sm border border-gray-200 p-6 space-y-4">
             <h2 className="text-lg font-semibold text-gray-800">
                 Model Configuration
             </h2>
+
+            {isMobile && (
+                <div className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                    <p className="font-medium">Mobile device detected</p>
+                    <p className="mt-1 text-xs text-amber-700">
+                        This 7B-parameter model requires significant GPU memory and may crash on mobile devices.
+                        For best results, use a desktop computer with 16+ GB RAM.
+                    </p>
+                </div>
+            )}
 
             <div className="space-y-3">
                 <div>
