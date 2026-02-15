@@ -197,12 +197,20 @@ async function loadModel(config) {
         console.error("[worker] Model loading failed:", err);
         console.error("[worker] Error stack:", err?.stack);
 
+        let userMessage;
+        if (msg.includes("bad_alloc") || msg.includes("out of memory") || msg.includes("OOM")) {
+            userMessage = `Out of GPU memory (${dtype.toUpperCase()} model). ` +
+                (dtype !== "q4"
+                    ? `Try selecting Q4 quantization (~5.4 GB) instead of ${dtype.toUpperCase()}.`
+                    : `This model requires more GPU memory than your device has available. Try a desktop with a dedicated GPU.`);
+        } else {
+            userMessage = `WebGPU model loading failed: ${msg}. ` +
+                `Try using a browser with WebGPU support (Chrome 113+).`;
+        }
+
         self.postMessage({
             type: "error",
-            data: {
-                message: `WebGPU model loading failed: ${msg}. ` +
-                    `Try using a browser with WebGPU support (Chrome 113+).`,
-            },
+            data: { message: userMessage },
         });
     }
 }
