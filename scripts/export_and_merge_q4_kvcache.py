@@ -739,6 +739,73 @@ def _get_subgraphs(model):
     return [model.graph]
 
 
+def _convert_bf16_to_fp32(model):
+    """Convert all bf16 tensors and type references to fp32 for WebGPU compatibility.
+
+    WebGPU doesn't support bfloat16. This converts:
+    - Graph inputs/outputs elem_type from bf16 → fp32
+    - Subgraph inputs/outputs elem_type from bf16 → fp32
+    - Initializer data_type from bf16 → fp32 (both inline and external)
+    - Cast nodes targeting bf16 → target fp32 instead
+
+    Returns a set of initializer names whose external data needs bf16→fp32
+    conversion during resharding.
+    """
+    BF16 = TensorProto.BFLOAT16  # 16
+    FP32 = TensorProto.FLOAT     # 1
+    BF16_ELEM = 16  # onnx.TensorProto.BFLOAT16 elem_type for TypeProto
+
+    converted_count = 0
+    bf16_external_inits = set()  # names of external inits that were bf16
+
+    def _fix_value_info(vi):
+        """Fix a single ValueInfoProto's tensor type."""
+        nonlocal converted_count
+        if vi.type.HasField("tensor_type") and vi.type.tensor_type.elem_type == BF16_ELEM:
+            vi.type.tensor_type.elem_type = FP32
+            converted_count += 1
+
+    def _fix_graph(graph):
+        """Fix all bf16 references in a graph."""
+        nonlocal converted_count
+        # Fix inputs/outputs/value_info
+        for vi in list(graph.input) + list(graph.output) + list(graph.value_info):
+            _fix_value_info(vi)
+
+        # Fix initializers
+        for init in graph.initializer:
+            if init.data_type == BF16:
+                has_external = any(e.key == "location" for e in init.external_data)
+                if has_external:
+                    # External data — mark for conversion during resharding
+                    bf16_external_inits.add(init.name)
+                elif init.raw_data:
+                    # Inline data — convert in place
+                    bf16_arr = np.frombuffer(init.raw_data, dtype=np.uint16)
+                    fp32_arr = (bf16_arr.astype(np.uint32) << 16).view(np.float32)
+                    init.raw_data = fp32_arr.tobytes()
+                init.data_type = FP32
+                converted_count += 1
+
+        # Fix Cast nodes that target bf16
+        for node in graph.node:
+            if node.op_type == "Cast":
+                for attr in node.attribute:
+                    if attr.name == "to" and attr.i == BF16:
+                        attr.i = FP32
+                        converted_count += 1
+            # Recurse into subgraphs (If/Loop/Scan)
+            for attr in node.attribute:
+                if attr.g and attr.g.ByteSize() > 0:
+                    _fix_graph(attr.g)
+
+    _fix_graph(model.graph)
+    print(f"  Converted {converted_count} bf16 references to fp32")
+    if bf16_external_inits:
+        print(f"  {len(bf16_external_inits)} external initializers need data conversion during reshard")
+    return bf16_external_inits
+
+
 def quantize_q4(merged_path):
     """Quantize merged model to Q4 using MatMulNBits.
 
@@ -951,6 +1018,10 @@ def quantize_q4(merged_path):
                                 break
             break
 
+    # Convert bf16 → fp32 for WebGPU compatibility (WebGPU doesn't support bf16)
+    print("\n  Converting bf16 → fp32 for WebGPU compatibility...")
+    bf16_external_inits = _convert_bf16_to_fp32(model)
+
     # Reshard
     print("\n  Resharding...")
     out_name = "decoder_model_merged_q4.onnx"
@@ -993,13 +1064,17 @@ def quantize_q4(merged_path):
                 set_external_data(init, loc, off, length)
             continue
 
-        # External data
+        # External data — convert bf16→fp32 if needed
         src_file = src_dir / info["location"]
         src_offset = int(info.get("offset", "0"))
         src_length = int(info["length"])
         with open(src_file, "rb") as f:
             f.seek(src_offset)
             data = f.read(src_length)
+        if init.name in bf16_external_inits:
+            bf16_arr = np.frombuffer(data, dtype=np.uint16)
+            fp32_arr = (bf16_arr.astype(np.uint32) << 16).view(np.float32)
+            data = fp32_arr.tobytes()
         loc, off, length = write_to_shard(data)
         set_external_data(init, loc, off, length)
 
