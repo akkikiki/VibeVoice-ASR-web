@@ -1,125 +1,105 @@
 # VibeVoice-ASR-web
 
-ONNX export tools for running [VibeVoice-ASR](https://huggingface.co/microsoft/VibeVoice-ASR) in the browser via Transformers.js + WebGPU.
+Browser-based speech recognition using [VibeVoice-ASR](https://huggingface.co/microsoft/VibeVoice-ASR) via Transformers.js v4 + WebGPU.
+
+**Live Demo:** [huggingface.co/spaces/akkikiki/VibeVoice-ASR](https://huggingface.co/spaces/akkikiki/VibeVoice-ASR)
 
 ## Features
 
-- **Browser-based inference** with WebGPU acceleration
-- **Model selector UI** — choose decode mode (with/without KV-cache) and quantization (INT8 ~9 GB, Q4 ~5.4 GB)
-- **KV-cache support** — merged decoder model with If-node conditional routing between prefill and decode paths for fast autoregressive generation
-- **Q4 quantization** — 4-bit MatMulNBits for small download sizes
+- **Browser-based inference** with WebGPU acceleration (no server required)
+- **Model selector UI** — choose decode mode (with/without KV-cache) and quantization (INT8, Q4)
+- **KV-cache support** — merged decoder with If-node conditional routing between prefill and decode paths
+- **Configurable generation** — adjustable max tokens, editable prompt template, stop generation button
+- **Repetition penalty** — frequency-based penalty + n-gram blocking to prevent degenerate outputs
+- **Mobile detection** — warns users that the 7B model requires desktop-class GPU memory
+- **Verbose loading status** — shows download progress and WebGPU shader compilation phase
 
-## Exported Subgraphs
+## Architecture
 
-### Without KV-cache
+VibeVoice-ASR is a composite speech recognition model:
 
-| Model | Input | Output |
-|-------|-------|--------|
-| `speech_encoder` | audio waveform | speech embeddings |
-| `decoder_with_speech` | input_ids + speech embeddings | logits (prefill) |
-| `decoder` | input_ids | logits (autoregressive) |
+| Component | Architecture | Purpose |
+|-----------|-------------|---------|
+| Speech Encoder | Custom ConvNeXt-style VAE + Transformer | Encodes 24kHz audio → speech embeddings (1, T, 3584) |
+| Decoder (LM) | Qwen2-7B (28 layers, 28 heads, 4 KV heads) | Autoregressive text generation from speech + text |
 
-### With KV-cache (merged decoder)
+## ONNX Models
 
-| Model | Input | Output |
-|-------|-------|--------|
-| `speech_encoder` | audio waveform | speech embeddings |
-| `decoder_model_merged` | input_ids + speech_embeddings + past_key_values + use_cache_branch | logits + present_key_values |
+The app loads two ONNX subgraphs via `WhisperForConditionalGeneration.from_pretrained()`:
 
-The merged decoder uses an ONNX If-node to route between the prefill path (processes speech embeddings, outputs KV-cache) and the decode path (uses cached KVs for fast token generation). Weights are deduplicated across both branches.
+| File | Inputs | Outputs |
+|------|--------|---------|
+| `encoder_model_fp16.onnx` | `audio` (1, 1, samples) | `speech_embeddings` (1, T, 3584) |
+| `decoder_model_merged_{dtype}.onnx` | `input_ids`, `speech_embeddings`, [`past_key_values.*`, `use_cache_branch`] | `logits`, [`present.*`] |
 
-## Usage
+### Quantization Options
+
+| DType | Decoder Size | Total Download | Decoder Shards | Notes |
+|-------|-------------|---------------|----------------|-------|
+| Q4 | ~3 GB | ~5.7 GB | 4 | MatMulNBits (Q4) + int8 DequantizeLinear lm_head |
+| INT8 | ~6 GB | ~9 GB | 5 | DequantizeLinear + MatMul (slower shader compilation) |
+
+All external data shards are kept under 1.9 GB for browser `ArrayBuffer` compatibility.
+
+## Quick Start
 
 ```bash
-# Export to ONNX (default: fp32, without KV-cache)
-python export_onnx.py --output_dir ./onnx_output --dtype float32
-
-# Validate against PyTorch
-python validate_onnx.py --onnx_dir ./onnx_output
-
-# Quantize
-python quantize_onnx.py
-
-# Test transcription
-python test_transcription.py
-
-# Export merged Q4 KV-cache decoder (requires ~30-40 GB RAM)
-python scripts/export_and_merge_q4_kvcache.py --output_dir ./onnx_kvcache
+npm install
+npm run dev
 ```
 
-## Export Results
+Open `http://localhost:5173`, select a model configuration, and click "Load Model". First load downloads the model (~5-9 GB) and compiles WebGPU shaders (may take several minutes for INT8). Subsequent loads use the browser cache.
 
-### fp32 (baseline)
+## Project Structure
 
-| Component | Size |
-|-----------|------|
-| `speech_encoder.onnx` + `.data` | 2.9 GB |
-| `decoder_with_speech.onnx` + `.data` | 30.5 GB |
-| `decoder.onnx` + `.data` | 30.5 GB |
+```
+src/
+├── App.tsx                  # Main UI with generation settings
+├── worker.js                # Web Worker: model loading, encoding, decoding
+├── hooks/useTranscriber.ts  # React hook bridging UI ↔ worker messages
+├── components/
+│   ├── ModelSelector.tsx    # Decode mode + quantization picker
+│   ├── AudioManager.tsx     # Upload / record audio
+│   ├── Progress.tsx         # Download / loading progress display
+│   └── Transcript.tsx       # Transcription output display
+└── utils/
+    └── Constants.ts         # Model config, shard counts, prompt template
+```
 
-### fp16
+## Export Scripts
 
-| Component | Size | Notes |
-|-----------|------|-------|
-| `speech_encoder.onnx` + `.data` | 1.4 GB | Manual fp16 cast (see below) |
-| `decoder_with_speech.onnx` + `.data` | 15.2 GB | Direct PyTorch fp16 export |
-| `decoder.onnx` + `.data` | 15.2 GB | Direct PyTorch fp16 export |
+Scripts for exporting and quantizing the ONNX models:
 
-**Speech encoder fp16 fix:** The `onnxruntime.transformers.float16.convert_float_to_float16()`
-converter produced an empty graph (0 nodes, 0 initializers) for the speech encoder — likely
-due to the VAE architecture (Conv1d + GroupNorm + residual blocks) triggering an edge case.
-The fix was to manually cast each fp32 weight tensor to fp16 using numpy, which preserved
-all 1911 ONNX nodes.
+| Script | Purpose |
+|--------|---------|
+| `scripts/export_decoder_with_kvcache.py` | Export merged decoder with KV-cache (If-node routing) |
+| `scripts/export_and_merge_q4_kvcache.py` | Q4 quantization + causal mask fixup + bf16→fp32 conversion |
+| `scripts/quantize_kvcache_int8.py` | INT8 streaming quantization |
+| `scripts/merge_and_quantize_q4.py` | Q4 quantization pipeline |
 
-### int4
+### WebGPU Compatibility Fixes (applied during export)
 
-| Component | Size | MatMul tensors quantized | Cosine sim vs fp32 |
-|-----------|------|--------------------------|---------------------|
-| `speech_encoder.onnx` + `.data` | 0.75 GB | 71 | 0.998 |
-| `decoder_with_speech.onnx` + `.data` | 6.71 GB | 197 | 0.980 |
-| `decoder.onnx` + `.data` | 6.71 GB | 197 | 0.990 |
-| **Total** | **~14.2 GB** | | |
+- **bf16→fp32 conversion** — all tensors, Cast nodes, and Constant nodes (RoPE cos/sin), since WebGPU doesn't support bfloat16
+- **Dynamic causal mask** — replaces hardcoded seq_len constants with Shape→Gather ops for variable-length sequences
+- **Rare dummy seq_len (73)** — avoids accidentally replacing unrelated constants during graph fixup
+- **Topological sort fix** — ensures fixup nodes are inserted after their dynamic scalar producers
 
-**Int4 quantization approach:** The standard `onnxruntime.quantization.quantize_dynamic` with
-`QUInt4` failed for two reasons: (1) it doesn't support Conv layers for int4, and (2) loading
-the 30GB fp32 models OOM'd on 32GB RAM. The solution uses a streaming approach:
+## Decoding Strategy
 
-1. Load ONNX model structure WITHOUT external data (just the graph)
-2. Read each tensor's data from the external `.data` file one at a time
-3. For MatMul weights: quantize to int4 with block-wise symmetric quantization
-   (block_size=32) and write packed data to output file
-4. For other weights: copy bytes directly from source to output file
-5. Replace `MatMul` ops with `MatMulNBits` (onnxruntime `com.microsoft` domain)
-6. Small tensors (<4KB) are inlined in the model file for shape inference
+- **Greedy decoding** with token suppression (`[Unintelligible Speech]` penalty)
+- **Frequency-based repetition penalty** (1.3^n per token occurrence)
+- **4-gram blocking** — hard suppresses tokens that would create a 4-gram seen 3+ times
+- **Configurable max tokens** (default: 128)
+- **Stop generation** button for user-initiated interruption
 
-This approach keeps memory usage under ~500MB regardless of model size. Key gotchas:
-- `MatMulNBits` quantizes along K (contraction dim), storing data as (N, ...) transposed
-- Protobuf has a 2GB per-field limit — must use external data for large tensors
-- `onnx.save(save_as_external_data=True)` can produce bloated files; use
-  `convert_model_to_external_data()` + `onnx.save()` or write the data file manually
-- Scalar/tiny tensors may use typed fields (e.g. `int64_data`) instead of `raw_data`
+## Known Issues
 
-### Q4 with KV-cache (merged decoder)
+- **WebGPU shader compilation is slow** — INT8 decoder (~2300 nodes) takes 10+ minutes on first load due to per-op shader compilation. Q4 is faster because `MatMulNBits` is a single fused op vs `DequantizeLinear + MatMul` (2 ops per layer).
+- **No EOS emission** — the quantized model sometimes fails to emit `<|im_end|>` (token 151645), causing generation to run until max tokens. This is a quantization quality issue.
+- **Mobile not supported** — the 7B model requires more GPU memory than mobile devices can allocate. Desktop with 16+ GB RAM recommended.
+- **INT8 requires more GPU memory** — ~9 GB total, may OOM on machines with ≤32 GB unified memory. Q4 (~5.7 GB) is recommended for most setups.
+- **Custom encoder architecture** — the speech encoder uses a non-standard ConvNeXt-style VAE. Do NOT apply standard transformer graph optimizations to it (breaks the model).
 
-| Component | Size | Notes |
-|-----------|------|-------|
-| `speech_encoder.onnx` + `.data` | 0.75 GB | Same as int4 |
-| `decoder_model_merged.onnx` + `.data` | ~4.7 GB | Merged prefill+decode, Q4 MatMulNBits |
-| **Total** | **~5.4 GB** | |
+## Pre-exported Weights
 
-**KV-cache export pipeline** (`scripts/export_and_merge_q4_kvcache.py`):
-1. Load Qwen2 language model weights from VibeVoice-ASR in bf16
-2. Export two ONNX subgraphs (prefill + decode-with-past)
-3. Merge into single model with If-node conditional routing
-4. Quantize MatMul layers to 4-bit (MatMulNBits), keep embeddings at fp16
-5. Optionally upload to HuggingFace Hub
-
-**WebGPU compatibility fixes applied during export:**
-- bf16→fp32 conversion for all tensors, Cast nodes, and Constant nodes (RoPE cos/sin) since WebGPU doesn't support bfloat16
-- Dynamic causal mask: replaces hardcoded seq_len constants with Shape→Gather ops for variable-length sequences
-- Uses rare dummy seq_len (73) during tracing to avoid replacing unrelated constants in the graph
-- Topological sort fix for dynamic scalar tracing from graph
-
-## ONNX Weights
-
-Pre-exported weights: [akkikiki/VibeVoice-ASR-onnx](https://huggingface.co/akkikiki/VibeVoice-ASR-onnx)
+[akkikiki/VibeVoice-ASR-onnx](https://huggingface.co/akkikiki/VibeVoice-ASR-onnx) on HuggingFace
