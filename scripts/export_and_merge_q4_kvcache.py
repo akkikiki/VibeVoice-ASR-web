@@ -138,7 +138,7 @@ class PrefillWrapper(nn.Module):
         self.model = model.model  # Qwen2Model
         self.lm_head = model.lm_head
 
-    def forward(self, input_ids, speech_embeddings):
+    def forward(self, input_ids, speech_embeddings, attention_mask):
         batch_size, seq_len = input_ids.shape
         speech_len = speech_embeddings.shape[1]
 
@@ -158,6 +158,7 @@ class PrefillWrapper(nn.Module):
 
         outputs = self.model(
             inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=None,
             use_cache=True,
@@ -191,7 +192,7 @@ class DecodeWithPastWrapper(nn.Module):
         self.model = model.model
         self.lm_head = model.lm_head
 
-    def forward(self, input_ids, *past_key_values_flat):
+    def forward(self, input_ids, attention_mask, *past_key_values_flat):
         batch_size = input_ids.shape[0]
 
         from transformers.cache_utils import DynamicCache
@@ -210,6 +211,7 @@ class DecodeWithPastWrapper(nn.Module):
 
         outputs = self.model(
             inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_kv,
             use_cache=True,
@@ -251,12 +253,14 @@ def export_onnx(model):
     model_dtype = next(model.parameters()).dtype
     dummy_ids = torch.randint(0, VOCAB_SIZE, (batch_size, seq_len))
     dummy_speech = torch.randn(batch_size, speech_len, HIDDEN_SIZE, dtype=model_dtype)
+    dummy_attn_mask = torch.ones(batch_size, seq_len, dtype=torch.long)
 
-    input_names = ["input_ids", "speech_embeddings"]
+    input_names = ["input_ids", "speech_embeddings", "attention_mask"]
     output_names = ["logits"]
     dynamic_axes = {
         "input_ids": {0: "batch_size", 1: "seq_len"},
         "speech_embeddings": {0: "batch_size", 1: "speech_len"},
+        "attention_mask": {0: "batch_size", 1: "seq_len"},
         "logits": {0: "batch_size", 1: "seq_len"},
     }
     for i in range(NUM_HIDDEN_LAYERS):
@@ -266,13 +270,13 @@ def export_onnx(model):
 
     # Test forward
     with torch.no_grad():
-        test = prefill(dummy_ids, dummy_speech)
+        test = prefill(dummy_ids, dummy_speech, dummy_attn_mask)
     print(f"  Prefill test OK. logits: {test[0].shape}, KV[0]: {test[1].shape}")
 
     prefill_path = EXPORT_DIR / "decoder_model.onnx"
     with torch.no_grad():
         torch.onnx.export(
-            prefill, (dummy_ids, dummy_speech), str(prefill_path),
+            prefill, (dummy_ids, dummy_speech, dummy_attn_mask), str(prefill_path),
             input_names=input_names, output_names=output_names,
             dynamic_axes=dynamic_axes, opset_version=17,
             do_constant_folding=True, export_params=True,
@@ -299,14 +303,21 @@ def export_onnx(model):
     model_dtype = next(model.parameters()).dtype
 
     dummy_ids_1 = torch.randint(0, VOCAB_SIZE, (1, 1))
+    # attention_mask covers past + current token: length = past_len + 1
+    past_len = 10
+    dummy_attn_mask_d = torch.ones(1, past_len + 1, dtype=torch.long)
     dummy_past = []
     for _ in range(NUM_HIDDEN_LAYERS):
-        dummy_past.append(torch.randn(1, NUM_KEY_VALUE_HEADS, 10, HEAD_DIM, dtype=model_dtype))
-        dummy_past.append(torch.randn(1, NUM_KEY_VALUE_HEADS, 10, HEAD_DIM, dtype=model_dtype))
+        dummy_past.append(torch.randn(1, NUM_KEY_VALUE_HEADS, past_len, HEAD_DIM, dtype=model_dtype))
+        dummy_past.append(torch.randn(1, NUM_KEY_VALUE_HEADS, past_len, HEAD_DIM, dtype=model_dtype))
 
-    input_names_d = ["input_ids"]
+    input_names_d = ["input_ids", "attention_mask"]
     output_names_d = ["logits"]
-    dynamic_axes_d = {"input_ids": {0: "batch_size"}, "logits": {0: "batch_size"}}
+    dynamic_axes_d = {
+        "input_ids": {0: "batch_size"},
+        "attention_mask": {0: "batch_size", 1: "total_len"},
+        "logits": {0: "batch_size"},
+    }
     for i in range(NUM_HIDDEN_LAYERS):
         input_names_d.extend([f"past_key_values.{i}.key", f"past_key_values.{i}.value"])
         output_names_d.extend([f"present.{i}.key", f"present.{i}.value"])
@@ -316,13 +327,13 @@ def export_onnx(model):
         dynamic_axes_d[f"present.{i}.value"] = {0: "batch_size", 2: "total_len"}
 
     with torch.no_grad():
-        test = decode(dummy_ids_1, *dummy_past)
+        test = decode(dummy_ids_1, dummy_attn_mask_d, *dummy_past)
     print(f"  Decode test OK. logits: {test[0].shape}, KV[0]: {test[1].shape}")
 
     decode_path = EXPORT_DIR / "decoder_with_past_model.onnx"
     with torch.no_grad():
         torch.onnx.export(
-            decode, (dummy_ids_1, *dummy_past), str(decode_path),
+            decode, (dummy_ids_1, dummy_attn_mask_d, *dummy_past), str(decode_path),
             input_names=input_names_d, output_names=output_names_d,
             dynamic_axes=dynamic_axes_d, opset_version=17,
             do_constant_folding=True, export_params=True,
