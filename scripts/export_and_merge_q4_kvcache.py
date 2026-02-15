@@ -351,55 +351,203 @@ def export_onnx(model):
 
 
 # ---------------------------------------------------------------------------
-# Step 3: Merge prefill + decode (lightweight, no full data load)
+# Step 3: Merge prefill + decode with If node (protobuf-only, no data load)
 # ---------------------------------------------------------------------------
 def merge_models(prefill_path, decode_path):
     """
-    Merge prefill + decode into decoder_model_merged using the prefill model
-    as the base (since it has all the weights). We just need to add the
-    use_cache_branch input and past_key_values inputs for the decode path.
+    Merge prefill + decode into a single model with an If node, replicating
+    what optimum.onnx.merge_decoders does but without loading ~30GB external
+    data into memory.
 
-    Since the models share the same weights (just different graph structure),
-    we use the prefill model as-is and skip the optimum merge which can't
-    handle >2 GB models in protobuf. The quantize step (Step 4) reads
-    from this merged output.
-
-    For this pipeline, we simply use the prefill model as the "merged" model
-    since the Q4 quantize step only needs the weight data and graph structure.
+    Both models share the same Qwen2 weights but torch.onnx.export assigns
+    different onnx::MatMul_* names. We deduplicate by matching node names
+    between graphs, so the merged model uses only prefill's external data file.
     """
+    import copy
+
     print("\n" + "=" * 60)
-    print("Step 3: Prepare merged model")
+    print("Step 3: Merge prefill + decode models (If node)")
     print("=" * 60)
 
     MERGED_DIR.mkdir(parents=True, exist_ok=True)
-    merged_path = MERGED_DIR / "decoder_model_merged.onnx"
 
-    # Copy the prefill model as the merged model (symlink the data file)
-    import shutil
-    print("Using prefill model as base for quantization...")
-    shutil.copy2(str(prefill_path), str(merged_path))
+    # Load both models without external data (~1.3 MB each)
+    print("Loading model protos (no external data)...")
+    prefill = onnx.load(str(prefill_path), load_external_data=False)
+    decode = onnx.load(str(decode_path), load_external_data=False)
 
-    # Copy/link the external data file
-    prefill_data = prefill_path.parent / "decoder_model.onnx_data"
-    merged_data = MERGED_DIR / "decoder_model_merged.onnx_data"
-    if prefill_data.exists():
-        if merged_data.exists():
-            merged_data.unlink()
-        os.symlink(str(prefill_data), str(merged_data))
-        print(f"  Linked external data: {merged_data.name}")
+    print(f"  Prefill: {len(prefill.graph.node)} nodes, {len(prefill.graph.initializer)} inits")
+    print(f"  Decode:  {len(decode.graph.node)} nodes, {len(decode.graph.initializer)} inits")
 
-    # Update the external data location reference in the protobuf
-    model = onnx.load(str(merged_path), load_external_data=False)
-    for init in model.graph.initializer:
+    # --- Classify initializers ---
+    p_inits = {i.name: i for i in prefill.graph.initializer}
+    d_inits = {i.name: i for i in decode.graph.initializer}
+
+    def is_small_init(init):
+        """Scalar or 1-D int initializers stay in subgraphs (optimum convention)."""
+        return len(init.dims) == 0 or (len(init.dims) == 1 and init.data_type in [6, 7])
+
+    # Truly shared: same name, same dims, same type
+    truly_shared = set()
+    name_collisions = set()
+    for name in set(p_inits) & set(d_inits):
+        if (tuple(p_inits[name].dims) == tuple(d_inits[name].dims) and
+                p_inits[name].data_type == d_inits[name].data_type):
+            truly_shared.add(name)
+        else:
+            name_collisions.add(name)
+
+    print(f"  Truly shared: {len(truly_shared)}, Name collisions: {len(name_collisions)}")
+
+    # --- Build decode → prefill initializer remapping ---
+    # Match large initializers by (node_name, input_idx) between graphs
+    def build_large_init_usage(graph, init_map):
+        usage = {}
+        for node in graph.node:
+            for idx, inp in enumerate(node.input):
+                if inp in init_map and not is_small_init(init_map[inp]):
+                    usage[(node.name, idx)] = inp
+        return usage
+
+    p_usage = build_large_init_usage(prefill.graph, p_inits)
+    d_usage = build_large_init_usage(decode.graph, d_inits)
+
+    # Identity mapping for truly shared large initializers
+    remap = {}
+    for name in truly_shared:
+        if name in d_inits and not is_small_init(d_inits[name]):
+            remap[name] = name
+
+    # Match non-shared by node name + input position
+    for (node_name, inp_idx), d_init_name in d_usage.items():
+        if d_init_name not in remap:
+            p_init_name = p_usage.get((node_name, inp_idx))
+            if p_init_name:
+                remap[d_init_name] = p_init_name
+
+    remapped_count = sum(1 for k, v in remap.items() if k != v)
+    print(f"  Remapped {remapped_count} decode initializers to prefill equivalents")
+
+    unmapped = [n for n in d_inits if not is_small_init(d_inits[n]) and n not in remap]
+    if unmapped:
+        print(f"  WARNING: {len(unmapped)} unmapped large decode initializers: {unmapped[:3]}")
+
+    # --- Apply remapping to decode graph nodes ---
+    for node in decode.graph.node:
+        for idx in range(len(node.input)):
+            if node.input[idx] in remap:
+                node.input[idx] = remap[node.input[idx]]
+
+    # --- Unify outputs ---
+    # Both models have the same output names; use prefill's shape specs
+    p_out_map = {o.name: o for o in prefill.graph.output}
+    unified_d_outputs = []
+    for d_out in decode.graph.output:
+        if d_out.name in p_out_map:
+            unified_d_outputs.append(copy.deepcopy(p_out_map[d_out.name]))
+        else:
+            unified_d_outputs.append(d_out)
+
+    # --- Separate small vs large initializers ---
+    prefill_small = [i for i in prefill.graph.initializer if is_small_init(i)]
+    decode_small = [i for i in decode.graph.initializer if is_small_init(i)]
+    large_inits = [i for i in prefill.graph.initializer if not is_small_init(i)]
+
+    # Update external data location to merged filename
+    merged_data_name = "decoder_model_merged.onnx_data"
+    for init in large_inits:
         for ext in init.external_data:
-            if ext.key == "location" and ext.value == "decoder_model.onnx_data":
-                ext.value = "decoder_model_merged.onnx_data"
-    onnx.save(model, str(merged_path))
+            if ext.key == "location":
+                ext.value = merged_data_name
 
-    print(f"  Nodes: {len(model.graph.node)}")
-    print(f"  Saved: {merged_path}")
+    print(f"  Large (top-level): {len(large_inits)}, "
+          f"Small (prefill sub): {len(prefill_small)}, Small (decode sub): {len(decode_small)}")
 
-    del model
+    # --- Build subgraphs ---
+    no_past_branch = helper.make_graph(
+        nodes=prefill.graph.node,
+        name="no_past",
+        inputs=[],
+        outputs=list(prefill.graph.output),
+        initializer=prefill_small,
+    )
+
+    with_past_branch = helper.make_graph(
+        nodes=decode.graph.node,
+        name="with_past",
+        inputs=[],
+        outputs=unified_d_outputs,
+        initializer=decode_small,
+    )
+
+    # --- Union of all inputs + use_cache_branch ---
+    all_inputs = []
+    seen = set()
+    for inp in list(prefill.graph.input) + list(decode.graph.input):
+        if inp.name not in seen:
+            all_inputs.append(inp)
+            seen.add(inp.name)
+
+    use_cache_branch = helper.make_tensor_value_info(
+        name="use_cache_branch", elem_type=TensorProto.BOOL, shape=[1],
+    )
+
+    # --- If node: true → with_past, false → no_past ---
+    if_node = helper.make_node(
+        "If",
+        inputs=["use_cache_branch"],
+        outputs=[o.name for o in no_past_branch.output],
+        name="optimum::if",
+        then_branch=with_past_branch,
+        else_branch=no_past_branch,
+    )
+
+    merged_graph = helper.make_graph(
+        nodes=[if_node],
+        name="merged",
+        inputs=[*all_inputs, use_cache_branch],
+        outputs=list(no_past_branch.output),
+        initializer=large_inits,
+    )
+
+    # Preserve opset imports from both models
+    opset_imports = []
+    opset_domains = set()
+    for oi in list(prefill.opset_import) + list(decode.opset_import):
+        if oi.domain not in opset_domains:
+            opset_imports.append(oi)
+            opset_domains.add(oi.domain)
+
+    merged_model = helper.make_model_gen_version(
+        merged_graph, producer_name="optimum-onnx",
+        opset_imports=opset_imports, ir_version=9,
+    )
+
+    # Save merged protobuf
+    merged_path = MERGED_DIR / "decoder_model_merged.onnx"
+    onnx.save(merged_model, str(merged_path))
+
+    # Symlink prefill's external data
+    prefill_data = prefill_path.parent / "decoder_model.onnx_data"
+    merged_data = MERGED_DIR / merged_data_name
+    if merged_data.exists():
+        merged_data.unlink()
+    os.symlink(str(prefill_data.resolve()), str(merged_data))
+
+    # --- Verify ---
+    m = onnx.load(str(merged_path), load_external_data=False)
+    input_names = [i.name for i in m.graph.input]
+    output_names = [o.name for o in m.graph.output]
+    proto_mb = merged_path.stat().st_size / 1e6
+
+    print(f"\n  Merged proto: {proto_mb:.1f} MB")
+    print(f"  Inputs ({len(input_names)}): {input_names[:3]} ... {input_names[-1]}")
+    print(f"  Outputs ({len(output_names)}): {output_names[:2]} ... {output_names[-1]}")
+    print(f"  use_cache_branch: {'use_cache_branch' in input_names}")
+    print(f"  past_key_values:  {any(n.startswith('past_key_values') for n in input_names)}")
+    print(f"  speech_embeddings: {'speech_embeddings' in input_names}")
+
+    del prefill, decode, merged_model, m
     gc.collect()
 
     return merged_path
@@ -422,8 +570,23 @@ def set_external_data(init, location, offset, length):
     init.external_data.add(key="length", value=str(length))
 
 
+def _get_subgraphs(model):
+    """Extract If-node subgraphs, or return [model.graph] for flat models."""
+    for node in model.graph.node:
+        if node.op_type == "If":
+            sgs = {}
+            for attr in node.attribute:
+                if attr.name in ("then_branch", "else_branch"):
+                    sgs[attr.name] = attr.g
+            return [sgs["then_branch"], sgs["else_branch"]]
+    return [model.graph]
+
+
 def quantize_q4(merged_path):
-    """Quantize merged model to Q4 using MatMulNBits."""
+    """Quantize merged model to Q4 using MatMulNBits.
+
+    Handles both flat graphs and If-node merged graphs (subgraphs).
+    """
     print("\n" + "=" * 60)
     print("Step 4: Quantize to Q4 + reshard")
     print("=" * 60)
@@ -437,32 +600,41 @@ def quantize_q4(merged_path):
     model = onnx.load(str(merged_path), load_external_data=False)
     src_dir = merged_path.parent
 
-    # Find MatMul weight initializers
-    matmul_weight_names = set()
-    matmul_nodes = []
-    for node in model.graph.node:
-        if node.op_type == "MatMul":
-            matmul_nodes.append(node)
-            for inp_name in node.input:
-                matmul_weight_names.add(inp_name)
+    # Get subgraphs (works for both flat and If-node models)
+    subgraphs = _get_subgraphs(model)
+    is_merged = len(subgraphs) == 2
+    print(f"  Model type: {'If-node merged' if is_merged else 'flat'} ({len(subgraphs)} subgraph(s))")
 
+    # Top-level initializer map
     init_map = {init.name: init for init in model.graph.initializer}
-    matmul_weight_names = matmul_weight_names & set(init_map.keys())
 
-    # Quantize FP32 or BF16 external weight tensors, skip embed_tokens
-    fp32_weights = {}
-    for name in matmul_weight_names:
-        init = init_map[name]
-        info = get_external_info(init)
-        if "location" in info and init.data_type in (TensorProto.FLOAT, TensorProto.BFLOAT16):
-            fp32_weights[name] = init
+    # Also include subgraph initializers (small scalars etc.)
+    sg_init_map = {}
+    for sg in subgraphs:
+        for init in sg.initializer:
+            sg_init_map[init.name] = init
 
-    # Don't Q4 the embedding
-    for key in list(fp32_weights.keys()):
-        if "embed_tokens" in key:
-            del fp32_weights[key]
+    # Collect MatMul nodes from all subgraphs
+    # (subgraph_ref, node, weight_name, weight_idx, activation_input)
+    matmul_entries = []
+    matmul_weight_names = set()
+    for sg in subgraphs:
+        for node in sg.node:
+            if node.op_type == "MatMul":
+                for idx, inp_name in enumerate(node.input):
+                    if inp_name in init_map:
+                        init = init_map[inp_name]
+                        info = get_external_info(init)
+                        if ("location" in info and
+                                init.data_type in (TensorProto.FLOAT, TensorProto.BFLOAT16) and
+                                "embed_tokens" not in inp_name and
+                                len(init.dims) == 2):
+                            matmul_weight_names.add(inp_name)
+                            matmul_entries.append((sg, node, inp_name, idx, node.input[1 - idx]))
+                        break
 
-    print(f"  MatMul FP32 weights to quantize: {len(fp32_weights)}")
+    print(f"  Unique MatMul weights to quantize: {len(matmul_weight_names)}")
+    print(f"  MatMul nodes to replace: {len(matmul_entries)}")
 
     src_data_info = {}
     for init in model.graph.initializer:
@@ -470,36 +642,20 @@ def quantize_q4(merged_path):
         if "location" in info:
             src_data_info[init.name] = info
 
-    # Process each MatMul
-    nodes_to_remove = []
-    nodes_to_add = []
+    # Quantize each unique weight once
+    quantized_data = {}  # weight_name → (b_name, scales_name, zp_name, K, N)
     inits_to_add = []
     inits_to_remove = set()
-    quantized_count = 0
 
-    for node in matmul_nodes:
-        weight_input = None
-        weight_idx = None
-        for idx, inp_name in enumerate(node.input):
-            if inp_name in fp32_weights:
-                weight_input = inp_name
-                weight_idx = idx
-                break
-        if weight_input is None:
-            continue
-
-        init = fp32_weights[weight_input]
-        info = src_data_info.get(weight_input)
+    for weight_name in sorted(matmul_weight_names):
+        init = init_map[weight_name]
+        info = src_data_info.get(weight_name)
         if info is None:
             continue
 
-        dims = list(init.dims)
-        if len(dims) != 2:
-            continue
+        K, N = list(init.dims)
 
-        K, N = dims
-
-        # Read weight data
+        # Read weight data from external file
         src_file = src_dir / info["location"]
         offset = int(info.get("offset", "0"))
         length = int(info["length"])
@@ -509,9 +665,7 @@ def quantize_q4(merged_path):
 
         # Handle both FP32 and BF16 data
         if init.data_type == TensorProto.BFLOAT16:
-            # BF16: read as uint16, convert to float32
             bf16_arr = np.frombuffer(raw_data, dtype=np.uint16)
-            # BF16 to FP32: shift left by 16 bits
             fp32_bytes = (bf16_arr.astype(np.uint32) << 16).view(np.float32)
             weight_arr = fp32_bytes.reshape(K, N)
         else:
@@ -548,39 +702,50 @@ def quantize_q4(merged_path):
         zp_packed_cols = (n_blocks_k + 1) // 2
         zp_packed = np.full((N, zp_packed_cols), 0x88, dtype=np.uint8)
 
-        b_name = f"{weight_input}_q4"
-        scales_name = f"{weight_input}_scales"
-        zp_name = f"{weight_input}_zp"
+        b_name = f"{weight_name}_q4"
+        scales_name = f"{weight_name}_scales"
+        zp_name = f"{weight_name}_zp"
 
         inits_to_add.append(numpy_helper.from_array(packed, name=b_name))
         inits_to_add.append(numpy_helper.from_array(block_scales, name=scales_name))
         inits_to_add.append(numpy_helper.from_array(zp_packed, name=zp_name))
-        inits_to_remove.add(weight_input)
+        inits_to_remove.add(weight_name)
 
-        activation_input = node.input[1 - weight_idx]
+        quantized_data[weight_name] = (b_name, scales_name, zp_name, K, N)
+
+        if len(quantized_data) % 20 == 0:
+            print(f"  Quantized {len(quantized_data)} weights...")
+
+    print(f"  Total unique weights quantized: {len(quantized_data)}")
+
+    # Replace MatMul → MatMulNBits in subgraphs
+    replace_count = 0
+    for sg, node, weight_name, weight_idx, activation_input in matmul_entries:
+        if weight_name not in quantized_data:
+            continue
+        b_name, scales_name, zp_name, K, N = quantized_data[weight_name]
+
         matmul_nbits = helper.make_node(
             "MatMulNBits",
             inputs=[activation_input, b_name, scales_name, zp_name],
             outputs=node.output,
-            name=node.name + "_q4" if node.name else f"matmulnbits_{quantized_count}",
+            name=node.name + "_q4" if node.name else f"matmulnbits_{replace_count}",
             domain="com.microsoft",
             K=K, N=N, bits=4, block_size=BLOCK_SIZE,
         )
 
-        nodes_to_remove.append(node)
-        nodes_to_add.append(matmul_nbits)
-        quantized_count += 1
+        # Replace in-place within the subgraph's node list
+        for i, n in enumerate(sg.node):
+            if n is node:
+                sg.node.remove(n)
+                sg.node.insert(i, matmul_nbits)
+                break
 
-        if quantized_count % 20 == 0:
-            print(f"  Quantized {quantized_count} weights...")
+        replace_count += 1
 
-    print(f"  Total: {quantized_count} MatMul -> MatMulNBits")
+    print(f"  Replaced {replace_count} MatMul nodes across {len(subgraphs)} subgraph(s)")
 
-    # Apply graph changes
-    for node in nodes_to_remove:
-        model.graph.node.remove(node)
-    model.graph.node.extend(nodes_to_add)
-
+    # Update top-level initializers
     new_inits = [init for init in model.graph.initializer if init.name not in inits_to_remove]
     new_inits.extend(inits_to_add)
     del model.graph.initializer[:]
@@ -602,30 +767,31 @@ def quantize_q4(merged_path):
             else:
                 fp32_arr = np.frombuffer(raw, dtype=np.float32)
             fp16_data = fp32_arr.astype(np.float16).tobytes()
-            print(f"  embed_tokens: FP32 {len(raw)/1e6:.1f} MB -> FP16 {len(fp16_data)/1e6:.1f} MB")
+            print(f"  embed_tokens: {len(raw)/1e6:.1f} MB -> FP16 {len(fp16_data)/1e6:.1f} MB")
 
+            orig_name = init.name
             fp16_name = init.name + "_fp16"
             init.name = fp16_name
             init.data_type = TensorProto.FLOAT16
             clear_external_data(init)
             init.raw_data = fp16_data
 
-            # Update Gather nodes
-            for node in model.graph.node:
-                if node.op_type == "Gather":
-                    orig_name = fp16_name.replace("_fp16", "")
-                    for idx, inp in enumerate(node.input):
-                        if inp == orig_name:
-                            node.input[idx] = fp16_name
-                            orig_out = node.output[0]
-                            node.output[0] = orig_out + "_fp16"
-                            cast = helper.make_node(
-                                "Cast", inputs=[orig_out + "_fp16"], outputs=[orig_out],
-                                name="cast_embed_fp16", to=TensorProto.FLOAT,
-                            )
-                            node_idx = list(model.graph.node).index(node)
-                            model.graph.node.insert(node_idx + 1, cast)
-                            break
+            # Update Gather nodes in all subgraphs
+            for sg in subgraphs:
+                for node in sg.node:
+                    if node.op_type == "Gather":
+                        for idx, inp in enumerate(node.input):
+                            if inp == orig_name:
+                                node.input[idx] = fp16_name
+                                orig_out = node.output[0]
+                                node.output[0] = orig_out + "_fp16"
+                                cast = helper.make_node(
+                                    "Cast", inputs=[orig_out + "_fp16"], outputs=[orig_out],
+                                    name=f"cast_embed_fp16_{sg.name}", to=TensorProto.FLOAT,
+                                )
+                                node_idx = list(sg.node).index(node)
+                                sg.node.insert(node_idx + 1, cast)
+                                break
             break
 
     # Reshard
@@ -696,6 +862,16 @@ def quantize_q4(merged_path):
         total += sz
         print(f"  {f.name}: {sz:.1f} MB")
     print(f"  Total: {total / 1024:.2f} GB")
+
+    # Verify Q4 model retains merged inputs/outputs
+    q4 = onnx.load(str(out_path), load_external_data=False)
+    q4_inputs = [i.name for i in q4.graph.input]
+    q4_outputs = [o.name for o in q4.graph.output]
+    print(f"\n  Q4 inputs ({len(q4_inputs)}): {q4_inputs[:3]} ... {q4_inputs[-1]}")
+    print(f"  Q4 outputs ({len(q4_outputs)}): {q4_outputs[:2]} ... {q4_outputs[-1]}")
+    print(f"  use_cache_branch: {'use_cache_branch' in q4_inputs}")
+    print(f"  past_key_values: {any(n.startswith('past_key_values') for n in q4_inputs)}")
+    del q4
 
     return num_shards
 
