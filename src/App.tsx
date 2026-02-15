@@ -19,11 +19,11 @@ function App() {
     useEffect(() => {
         async function checkWebGPU() {
             try {
-                if (!navigator.gpu) {
+                if (!(navigator as any).gpu) {
                     setWebgpuSupported(false);
                     return;
                 }
-                const adapter = await navigator.gpu.requestAdapter();
+                const adapter = await (navigator as any).gpu.requestAdapter();
                 setWebgpuSupported(!!adapter);
             } catch {
                 setWebgpuSupported(false);
