@@ -204,9 +204,21 @@ async function encodeSpeech(audioData) {
     return result.speech_embeddings;
 }
 
+// KV-cache config: 28 layers, 4 KV heads, 128 head_dim
+const NUM_LAYERS = 28;
+const NUM_KV_HEADS = 4;
+const HEAD_DIM = 128;
+
+/**
+ * Check if the decoder session has use_cache_branch input (merged KV-cache model).
+ */
+function hasKVCacheInputs() {
+    return decoderSession && decoderSession.inputNames.includes("use_cache_branch");
+}
+
 /**
  * Run decoder with given input_ids and speech embeddings.
- * Optionally accepts past key-value tensors for KV-cache mode.
+ * For merged KV-cache models, also passes use_cache_branch and past_key_values.
  */
 async function runDecoder(speechEmbeddings, inputIds, pastKeyValues) {
     const feeds = {
@@ -218,8 +230,30 @@ async function runDecoder(speechEmbeddings, inputIds, pastKeyValues) {
         speech_embeddings: speechEmbeddings,
     };
 
-    // If past key values provided, add them to feeds
-    if (pastKeyValues) {
+    // For merged KV-cache models: always provide use_cache_branch + past_key_values
+    if (hasKVCacheInputs()) {
+        const useCacheBranch = !!pastKeyValues;
+        feeds["use_cache_branch"] = new OrtTensor("bool", [useCacheBranch], [1]);
+
+        if (pastKeyValues) {
+            // Decode step: use actual KV-cache from previous step
+            for (const [name, tensor] of Object.entries(pastKeyValues)) {
+                feeds[name] = tensor;
+            }
+        } else {
+            // Prefill step: provide zero-length KV-cache tensors
+            for (let i = 0; i < NUM_LAYERS; i++) {
+                const emptyKV = new OrtTensor(
+                    "float32",
+                    new Float32Array(0),
+                    [1, NUM_KV_HEADS, 0, HEAD_DIM],
+                );
+                feeds[`past_key_values.${i}.key`] = emptyKV;
+                feeds[`past_key_values.${i}.value`] = emptyKV;
+            }
+        }
+    } else if (pastKeyValues) {
+        // Legacy non-merged model with KV-cache outputs only
         for (const [name, tensor] of Object.entries(pastKeyValues)) {
             feeds[name] = tensor;
         }
@@ -229,8 +263,14 @@ async function runDecoder(speechEmbeddings, inputIds, pastKeyValues) {
     return result;
 }
 
+// Token IDs to suppress during decoding (reduce hallucinated "[Unintelligible Speech]")
+// "[Unintelligible Speech]" = [58, 1806, 396, 6703, 1238, 38741, 60]
+// Penalize "Un" (1806) which starts "Unintelligible" — the main trigger token
+const SUPPRESSED_TOKENS = [1806];
+const SUPPRESSION_PENALTY = 10.0; // subtracted from logit
+
 /**
- * Greedy argmax over the last position's logits.
+ * Greedy argmax over the last position's logits, with optional token suppression.
  */
 function greedySample(logits) {
     const data = logits.data;
@@ -242,8 +282,12 @@ function greedySample(logits) {
     let maxIdx = 0;
 
     for (let i = 0; i < vocabSize; i++) {
-        if (data[offset + i] > maxVal) {
-            maxVal = data[offset + i];
+        let score = data[offset + i];
+        if (SUPPRESSED_TOKENS.includes(i)) {
+            score -= SUPPRESSION_PENALTY;
+        }
+        if (score > maxVal) {
+            maxVal = score;
             maxIdx = i;
         }
     }
