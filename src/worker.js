@@ -80,15 +80,18 @@ async function loadModel(config) {
         device = "webgpu";
 
         // Log WebGPU device limits for debugging
+        let hasShaderF16 = false;
         if (navigator.gpu) {
             try {
                 const adapter = await navigator.gpu.requestAdapter();
                 if (adapter) {
                     const adapterInfo = adapter.info || {};
                     const limits = adapter.limits;
+                    hasShaderF16 = adapter.features.has("shader-f16");
                     console.log(`[worker] WebGPU adapter: ${adapterInfo.vendor || "unknown"} / ${adapterInfo.architecture || "unknown"} / ${adapterInfo.device || "unknown"}`);
                     console.log(`[worker] WebGPU maxBufferSize: ${(limits.maxBufferSize / 1024 / 1024).toFixed(0)} MB`);
                     console.log(`[worker] WebGPU maxStorageBufferBindingSize: ${(limits.maxStorageBufferBindingSize / 1024 / 1024).toFixed(0)} MB`);
+                    console.log(`[worker] WebGPU shader-f16: ${hasShaderF16}`);
                 }
             } catch (e) {
                 console.warn("[worker] Could not query WebGPU adapter info:", e);
@@ -114,13 +117,14 @@ async function loadModel(config) {
 
         // Load model with transformers.js v4
         // Both modes use decoder_model_merged (it supports KV-cache internally)
-        console.log(`[worker] Loading model: encoder_model_fp16 + decoder_model_merged_${dtype} from "${MODEL_ID}"`);
+        const encoderDtype = hasShaderF16 ? "fp16" : "q4";
+        console.log(`[worker] Loading model: encoder_model_${encoderDtype} + decoder_model_merged_${dtype} from "${MODEL_ID}"`);
 
         const loadStart = performance.now();
         const model = await VibeVoiceASRModel.from_pretrained(MODEL_ID, {
             device: "webgpu",
             dtype: {
-                encoder_model: "fp16",
+                encoder_model: encoderDtype,
                 decoder_model_merged: dtype,
             },
             use_external_data_format: {
