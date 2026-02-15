@@ -127,13 +127,15 @@ export function useTranscriber() {
         workerRef.current.postMessage({ type: "load", config });
     }, []);
 
-    const transcribe = useCallback((audioData: Float32Array) => {
+    const transcribe = useCallback((audioData: Float32Array, promptTemplate?: string, maxTokens?: number) => {
         if (!workerRef.current) return;
 
         workerRef.current.postMessage({
             type: "transcribe",
             audio: audioData,
             sampleRate: SAMPLE_RATE,
+            promptTemplate,
+            maxTokens,
         });
     }, []);
 

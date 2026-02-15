@@ -21,7 +21,7 @@
 
 import { env, AutoTokenizer, WhisperForConditionalGeneration } from "@huggingface/transformers";
 import { Tensor as OrtTensor } from "onnxruntime-web/webgpu";
-import { MODEL_ID, EOS_TOKEN_ID, DEFAULT_MAX_NEW_TOKENS } from "./utils/Constants";
+import { MODEL_ID, EOS_TOKEN_ID, DEFAULT_MAX_NEW_TOKENS, DEFAULT_PROMPT_TEMPLATE } from "./utils/Constants";
 import { SHARD_COUNTS, TOTAL_FILE_SIZES } from "./utils/Constants";
 
 // Disable local model loading — always fetch from HuggingFace Hub
@@ -62,8 +62,7 @@ class VibeVoiceASRModel {
  * @param {object} config - { decodeMode: "no-kvcache"|"kvcache", dtype: "int8"|"q4" }
  */
 async function loadModel(config) {
-    const { decodeMode = "no-kvcache", dtype = "int8", maxTokens: configMaxTokens } = config || {};
-    maxTokens = configMaxTokens || DEFAULT_MAX_NEW_TOKENS;
+    const { decodeMode = "no-kvcache", dtype = "int8" } = config || {};
     const shards = SHARD_COUNTS[dtype];
     const totalFileSize = TOTAL_FILE_SIZES[dtype] || 9_000_000_000;
 
@@ -408,8 +407,9 @@ async function transcribeWithKVCache(speechEmbeddings, promptTokenIds) {
 /**
  * Run transcription pipeline.
  */
-async function transcribe(audioData) {
+async function transcribe(audioData, promptTemplate, tokenLimit) {
     stopRequested = false;
+    maxTokens = tokenLimit || DEFAULT_MAX_NEW_TOKENS;
     self.postMessage({ type: "transcription_start" });
 
     const t0 = performance.now();
@@ -422,7 +422,7 @@ async function transcribe(audioData) {
 
         // Step 2: Prepare prompt tokens
         const audioDuration = (audioData.length / 24000).toFixed(2);
-        const promptText = "<|im_start|>system\nYou are a helpful assistant that transcribes audio input into text output in JSON format.<|im_end|>\n<|im_start|>user\nThis is a " + audioDuration + " seconds audio, please transcribe it with these keys: Start time, End time, Speaker ID, Content<|im_end|>\n<|im_start|>assistant\n";
+        const promptText = (promptTemplate || DEFAULT_PROMPT_TEMPLATE).replace(/\{duration\}/g, audioDuration);
         const encoded = tokenizer(promptText, { return_tensors: false });
         const rawIds = encoded.input_ids;
         const promptTokenIds = Array.isArray(rawIds) ? rawIds : Array.from(rawIds.data || rawIds);
@@ -452,7 +452,7 @@ async function transcribe(audioData) {
 
 // Message handler
 self.onmessage = async (e) => {
-    const { type, audio, config } = e.data;
+    const { type, audio, config, promptTemplate, maxTokens: msgMaxTokens } = e.data;
 
     switch (type) {
         case "load":
@@ -471,7 +471,7 @@ self.onmessage = async (e) => {
                 });
                 return;
             }
-            await transcribe(audio);
+            await transcribe(audio, promptTemplate, msgMaxTokens);
             break;
     }
 };

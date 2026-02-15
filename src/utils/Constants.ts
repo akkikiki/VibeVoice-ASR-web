@@ -1,6 +1,6 @@
 export const SAMPLE_RATE = 24000;
 export const MODEL_ID = "akkikiki/VibeVoice-ASR-onnx";
-export const DEFAULT_MAX_NEW_TOKENS = 2048;
+export const DEFAULT_MAX_NEW_TOKENS = 128;
 // Special token IDs (Qwen2 tokenizer)
 export const BOS_TOKEN_ID = 151643;
 export const EOS_TOKEN_ID = 151645;
@@ -13,7 +13,6 @@ export type DType = "int8" | "fp16" | "q4";
 export interface ModelConfig {
     decodeMode: DecodeMode;
     dtype: DType;
-    maxTokens: number;
 }
 
 // Shard counts for decoder_model_merged per dtype
@@ -31,3 +30,11 @@ export const TOTAL_FILE_SIZES: Partial<Record<DType, number>> = {
 
 // Available dtype options
 export const AVAILABLE_DTYPES: DType[] = ["int8", "q4"];
+
+// Default prompt template. Use {duration} as placeholder for audio duration in seconds.
+export const DEFAULT_PROMPT_TEMPLATE = `<|im_start|>system
+You are a helpful assistant that transcribes audio input into text output in JSON format.<|im_end|>
+<|im_start|>user
+This is a {duration} seconds audio, please transcribe it with these keys: Start time, End time, Speaker ID, Content<|im_end|>
+<|im_start|>assistant
+`;
