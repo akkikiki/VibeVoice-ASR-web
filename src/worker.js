@@ -92,7 +92,8 @@ async function loadModel(config) {
 
         fileProgress.clear();
         const doneFiles = new Set();
-        let sessionPhase = "";
+        let allDownloaded = false;
+        let sessionStartTime = null;
 
         // Load model with transformers.js v4
         // Both modes use decoder_model_merged (it supports KV-cache internally)
@@ -125,38 +126,54 @@ async function loadModel(config) {
                     const elapsed = ((performance.now() - loadStart) / 1000).toFixed(1);
                     console.log(`[worker] Downloaded: ${p.file} (${elapsed}s)`);
                 } else if (p.status === "initiate" && p.file) {
-                    // Detect when session creation starts for a model file
                     const shortName = p.file.split("/").pop();
-                    if (shortName.endsWith(".onnx") && !sessionPhase.includes(shortName)) {
-                        sessionPhase = shortName;
+                    if (shortName.endsWith(".onnx")) {
                         const elapsed = ((performance.now() - loadStart) / 1000).toFixed(1);
                         console.log(`[worker] Loading ONNX file: ${shortName} (${elapsed}s)`);
+
+                        // Once downloads are done, show session creation status
+                        if (allDownloaded) {
+                            sessionStartTime = performance.now();
+                            const modelName = shortName.includes("encoder") ? "encoder" : "decoder";
+                            self.postMessage({
+                                type: "loading_status",
+                                data: { message: `Creating WebGPU session for ${modelName}... (compiling shaders)` },
+                            });
+                        }
                     }
                 } else if (p.status === "ready" && p.file) {
                     const shortName = p.file.split("/").pop();
                     const elapsed = ((performance.now() - loadStart) / 1000).toFixed(1);
-                    console.log(`[worker] Session ready: ${shortName} (${elapsed}s)`);
+                    const sessionTime = sessionStartTime
+                        ? ((performance.now() - sessionStartTime) / 1000).toFixed(1)
+                        : "?";
+                    console.log(`[worker] Session ready: ${shortName} (${elapsed}s total, ${sessionTime}s compile)`);
 
-                    // Update UI status with which session is being created next
                     if (shortName.includes("encoder")) {
+                        sessionStartTime = performance.now();
                         self.postMessage({
                             type: "loading_status",
-                            data: { message: "Encoder session ready. Creating decoder session..." },
+                            data: { message: `Encoder ready (${sessionTime}s). Creating decoder session... (compiling shaders, this may take a few minutes)` },
                         });
                     } else {
                         self.postMessage({
                             type: "loading_status",
-                            data: { message: "All sessions ready!" },
+                            data: { message: `All sessions ready! (decoder compiled in ${sessionTime}s)` },
                         });
                     }
                 }
 
-                // Show "Creating WebGPU session" when downloads are complete
-                if (p.status === "done") {
-                    self.postMessage({
-                        type: "loading_status",
-                        data: { message: "Creating WebGPU session..." },
-                    });
+                // Transition from download phase to session creation phase
+                if (p.status === "done" && !allDownloaded) {
+                    const loaded = Array.from(fileProgress.values()).reduce((a, b) => a + b, 0);
+                    if (loaded >= totalFileSize * 0.95) {
+                        allDownloaded = true;
+                        console.log("[worker] All files downloaded, creating WebGPU sessions...");
+                        self.postMessage({
+                            type: "loading_status",
+                            data: { message: "Downloads complete. Creating WebGPU sessions... (compiling shaders)" },
+                        });
+                    }
                 }
             },
         });

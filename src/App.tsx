@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import AudioManager from "./components/AudioManager";
 import Transcript from "./components/Transcript";
 import Progress from "./components/Progress";
@@ -14,6 +14,23 @@ function App() {
     const [promptTemplate, setPromptTemplate] = useState(DEFAULT_PROMPT_TEMPLATE);
     const [maxTokens, setMaxTokens] = useState(DEFAULT_MAX_NEW_TOKENS);
     const [showSettings, setShowSettings] = useState(false);
+    const [webgpuSupported, setWebgpuSupported] = useState<boolean | null>(null);
+
+    useEffect(() => {
+        async function checkWebGPU() {
+            try {
+                if (!navigator.gpu) {
+                    setWebgpuSupported(false);
+                    return;
+                }
+                const adapter = await navigator.gpu.requestAdapter();
+                setWebgpuSupported(!!adapter);
+            } catch {
+                setWebgpuSupported(false);
+            }
+        }
+        checkWebGPU();
+    }, []);
 
     const handleAudioReady = useCallback(
         (audioData: Float32Array) => {
@@ -22,6 +39,33 @@ function App() {
         },
         [isReady, transcribe, promptTemplate],
     );
+
+    if (webgpuSupported === false) {
+        return (
+            <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center px-4 py-8">
+                <div className="w-full max-w-md bg-white rounded-xl shadow-sm border border-red-200 p-6 text-center space-y-3">
+                    <h1 className="text-xl font-bold text-gray-900">
+                        VibeVoice ASR
+                    </h1>
+                    <p className="text-red-600 font-medium">
+                        WebGPU is not supported on this browser.
+                    </p>
+                    <p className="text-sm text-gray-500">
+                        This app requires WebGPU to run large speech recognition models in the browser.
+                        Please use a desktop browser with WebGPU support:
+                    </p>
+                    <ul className="text-sm text-gray-600 text-left list-disc list-inside space-y-1">
+                        <li>Chrome 113+ (desktop)</li>
+                        <li>Edge 113+ (desktop)</li>
+                        <li>Chrome on Android (behind flag)</li>
+                    </ul>
+                    <p className="text-xs text-gray-400 pt-2">
+                        On Android Chrome, try enabling <code className="bg-gray-100 px-1 rounded">chrome://flags/#enable-unsafe-webgpu</code>
+                    </p>
+                </div>
+            </div>
+        );
+    }
 
     return (
         <div className="min-h-screen bg-gray-50 flex flex-col items-center px-4 py-8">
