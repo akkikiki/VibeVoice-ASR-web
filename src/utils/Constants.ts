@@ -1,6 +1,6 @@
 export const SAMPLE_RATE = 24000;
 export const MODEL_ID = "akkikiki/VibeVoice-ASR-onnx";
-export const DEFAULT_MAX_NEW_TOKENS = 512;
+export const DEFAULT_MAX_NEW_TOKENS = 2048;
 // Special token IDs (Qwen2 tokenizer)
 export const BOS_TOKEN_ID = 151643;
 export const EOS_TOKEN_ID = 151645;
@@ -13,6 +13,7 @@ export type DType = "int8" | "fp16" | "q4";
 export interface ModelConfig {
     decodeMode: DecodeMode;
     dtype: DType;
+    maxTokens: number;
 }
 
 // Shard counts for decoder_model_merged per dtype

@@ -6,7 +6,7 @@ import ModelSelector from "./components/ModelSelector";
 import { useTranscriber } from "./hooks/useTranscriber";
 
 function App() {
-    const { status, result, transcribe, loadModel } = useTranscriber();
+    const { status, result, transcribe, loadModel, stopGeneration } = useTranscriber();
     const isIdle = status.status === "idle";
     const isReady = status.status === "ready";
     const isTranscribing = status.status === "transcribing";
@@ -50,6 +50,15 @@ function App() {
                             onAudioReady={handleAudioReady}
                             isTranscribing={!isReady || isTranscribing}
                         />
+
+                        {isTranscribing && (
+                            <button
+                                onClick={stopGeneration}
+                                className="rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 transition-colors"
+                            >
+                                Stop Generation
+                            </button>
+                        )}
 
                         <Transcript
                             result={result}

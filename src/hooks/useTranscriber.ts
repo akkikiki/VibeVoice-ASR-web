@@ -137,10 +137,16 @@ export function useTranscriber() {
         });
     }, []);
 
+    const stopGeneration = useCallback(() => {
+        if (!workerRef.current) return;
+        workerRef.current.postMessage({ type: "stop" });
+    }, []);
+
     return {
         status,
         result,
         transcribe,
         loadModel,
+        stopGeneration,
     };
 }

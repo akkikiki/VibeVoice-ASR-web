@@ -21,7 +21,7 @@
 
 import { env, AutoTokenizer, WhisperForConditionalGeneration } from "@huggingface/transformers";
 import { Tensor as OrtTensor } from "onnxruntime-web/webgpu";
-import { MODEL_ID, EOS_TOKEN_ID } from "./utils/Constants";
+import { MODEL_ID, EOS_TOKEN_ID, DEFAULT_MAX_NEW_TOKENS } from "./utils/Constants";
 import { SHARD_COUNTS, TOTAL_FILE_SIZES } from "./utils/Constants";
 
 // Disable local model loading — always fetch from HuggingFace Hub
@@ -34,6 +34,8 @@ let speechEncoderSession = null;
 let decoderSession = null;
 let device = null; // "webgpu" or "wasm"
 let currentDecodeMode = "no-kvcache"; // "no-kvcache" or "kvcache"
+let maxTokens = DEFAULT_MAX_NEW_TOKENS;
+let stopRequested = false;
 
 // Track download progress across all files
 const fileProgress = new Map();
@@ -60,7 +62,8 @@ class VibeVoiceASRModel {
  * @param {object} config - { decodeMode: "no-kvcache"|"kvcache", dtype: "int8"|"q4" }
  */
 async function loadModel(config) {
-    const { decodeMode = "no-kvcache", dtype = "int8" } = config || {};
+    const { decodeMode = "no-kvcache", dtype = "int8", maxTokens: configMaxTokens } = config || {};
+    maxTokens = configMaxTokens || DEFAULT_MAX_NEW_TOKENS;
     const shards = SHARD_COUNTS[dtype];
     const totalFileSize = TOTAL_FILE_SIZES[dtype] || 9_000_000_000;
 
@@ -316,12 +319,15 @@ function extractPastKeyValues(decoderOutput) {
  * Transcribe without KV-cache: re-run full decoder each step.
  */
 async function transcribeNoKVCache(speechEmbeddings, promptTokenIds) {
-    const MAX_TOKENS = 50;
     const generatedTokens = [];
     let currentIds = [...promptTokenIds];
 
-    for (let step = 0; step < MAX_TOKENS; step++) {
-        console.log(`[worker] Decode step ${step + 1}/${MAX_TOKENS} (no KV-cache)...`);
+    for (let step = 0; step < maxTokens; step++) {
+        if (stopRequested) {
+            console.log(`[worker] Stop requested at step ${step + 1}`);
+            break;
+        }
+        console.log(`[worker] Decode step ${step + 1}/${maxTokens} (no KV-cache)...`);
         const result = await runDecoder(speechEmbeddings, currentIds, null);
         const nextToken = greedySample(result.logits);
 
@@ -348,7 +354,6 @@ async function transcribeNoKVCache(speechEmbeddings, promptTokenIds) {
  * Transcribe with KV-cache: run prefill once, then decode with cached key/values.
  */
 async function transcribeWithKVCache(speechEmbeddings, promptTokenIds) {
-    const MAX_TOKENS = 50;
     const generatedTokens = [];
 
     // Step 1: Prefill — run full prompt through decoder to get first token + KV cache
@@ -371,8 +376,12 @@ async function transcribeWithKVCache(speechEmbeddings, promptTokenIds) {
     });
 
     // Step 2: Decode — pass only new token + past KV cache
-    for (let step = 1; step < MAX_TOKENS; step++) {
-        console.log(`[worker] Decode step ${step + 1}/${MAX_TOKENS} (KV-cache)...`);
+    for (let step = 1; step < maxTokens; step++) {
+        if (stopRequested) {
+            console.log(`[worker] Stop requested at step ${step + 1}`);
+            break;
+        }
+        console.log(`[worker] Decode step ${step + 1}/${maxTokens} (KV-cache)...`);
 
         // Only pass the last generated token (KV cache has the rest)
         result = await runDecoder(speechEmbeddings, [nextToken], pastKeyValues);
@@ -400,6 +409,7 @@ async function transcribeWithKVCache(speechEmbeddings, promptTokenIds) {
  * Run transcription pipeline.
  */
 async function transcribe(audioData) {
+    stopRequested = false;
     self.postMessage({ type: "transcription_start" });
 
     const t0 = performance.now();
@@ -447,6 +457,10 @@ self.onmessage = async (e) => {
     switch (type) {
         case "load":
             await loadModel(config);
+            break;
+
+        case "stop":
+            stopRequested = true;
             break;
 
         case "transcribe":
