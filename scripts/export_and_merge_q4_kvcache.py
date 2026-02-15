@@ -438,7 +438,7 @@ def export_onnx(model):
     prefill = PrefillWrapper(model)
     prefill.eval()
 
-    batch_size, seq_len, speech_len = 1, 10, 5
+    batch_size, seq_len, speech_len = 1, 73, 37
     model_dtype = next(model.parameters()).dtype
     dummy_ids = torch.randint(0, VOCAB_SIZE, (batch_size, seq_len))
     dummy_speech = torch.randn(batch_size, speech_len, HIDDEN_SIZE, dtype=model_dtype)
@@ -499,8 +499,8 @@ def export_onnx(model):
     dummy_ids_1 = torch.randint(0, VOCAB_SIZE, (1, 1))
     dummy_past = []
     for _ in range(NUM_HIDDEN_LAYERS):
-        dummy_past.append(torch.randn(1, NUM_KEY_VALUE_HEADS, 10, HEAD_DIM, dtype=model_dtype))
-        dummy_past.append(torch.randn(1, NUM_KEY_VALUE_HEADS, 10, HEAD_DIM, dtype=model_dtype))
+        dummy_past.append(torch.randn(1, NUM_KEY_VALUE_HEADS, 73, HEAD_DIM, dtype=model_dtype))
+        dummy_past.append(torch.randn(1, NUM_KEY_VALUE_HEADS, 73, HEAD_DIM, dtype=model_dtype))
 
     input_names_d = ["input_ids"]
     output_names_d = ["logits"]
@@ -526,12 +526,12 @@ def export_onnx(model):
             do_constant_folding=True, export_params=True,
             dynamo=False,  # Use legacy tracer-based exporter
         )
-    # Fix hardcoded causal mask constants (past_len=10 → total_len=11)
+    # Fix hardcoded causal mask constants (past_len=73 → total_len=74)
     print("  Fixing hardcoded causal mask constants...")
     decode_proto = onnx.load(str(decode_path), load_external_data=False)
-    _fix_causal_mask_constants(decode_proto, traced_seq_len=10,
+    _fix_causal_mask_constants(decode_proto, traced_seq_len=73,
                                source_input="past_key_values.0.key", source_dim=2)  # past_len
-    _fix_causal_mask_constants(decode_proto, traced_seq_len=11,
+    _fix_causal_mask_constants(decode_proto, traced_seq_len=74,
                                source_input="past_key_values.0.key", source_dim=2,
                                add_offset=1)  # total_len = past_len + 1
     onnx.save(decode_proto, str(decode_path))
