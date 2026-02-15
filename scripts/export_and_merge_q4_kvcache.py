@@ -787,9 +787,20 @@ def _convert_bf16_to_fp32(model):
                 init.data_type = FP32
                 converted_count += 1
 
-        # Fix Cast nodes that target bf16
+        # Fix nodes
         for node in graph.node:
-            if node.op_type == "Cast":
+            # Fix Constant nodes with bf16 tensor values (e.g. RoPE cos/sin)
+            if node.op_type == "Constant":
+                for attr in node.attribute:
+                    if attr.name == "value" and attr.t and attr.t.data_type == BF16:
+                        if attr.t.raw_data:
+                            bf16_arr = np.frombuffer(attr.t.raw_data, dtype=np.uint16)
+                            fp32_arr = (bf16_arr.astype(np.uint32) << 16).view(np.float32)
+                            attr.t.raw_data = fp32_arr.tobytes()
+                        attr.t.data_type = FP32
+                        converted_count += 1
+            # Fix Cast nodes that target bf16
+            elif node.op_type == "Cast":
                 for attr in node.attribute:
                     if attr.name == "to" and attr.i == BF16:
                         attr.i = FP32
