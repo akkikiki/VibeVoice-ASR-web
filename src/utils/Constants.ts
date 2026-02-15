@@ -19,13 +19,13 @@ export interface ModelConfig {
 // (both decode modes use the same merged decoder ONNX file)
 export const SHARD_COUNTS: Partial<Record<DType, { encoder: number; decoder: number }>> = {
     int8: { encoder: 1, decoder: 5 },
-    q4: { encoder: 1, decoder: 3 },
+    q4: { encoder: 1, decoder: 4 },
 };
 
 // Approximate total download sizes in bytes per dtype (for progress bar)
 export const TOTAL_FILE_SIZES: Partial<Record<DType, number>> = {
     int8: 9_000_000_000,
-    q4: 5_400_000_000,
+    q4: 5_700_000_000,
 };
 
 // Available dtype options

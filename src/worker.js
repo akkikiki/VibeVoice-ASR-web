@@ -325,23 +325,80 @@ async function runDecoder(speechEmbeddings, inputIds, pastKeyValues) {
 const SUPPRESSED_TOKENS = [1806];
 const SUPPRESSION_PENALTY = 10.0; // subtracted from logit
 
+// Repetition penalty: frequency-based (scales with number of occurrences)
+const REPETITION_PENALTY = 1.3; // base multiplicative penalty per occurrence
+const MAX_NGRAM_REPEAT = 3; // block 4-grams that have appeared this many times
+
 /**
- * Greedy argmax over the last position's logits, with optional token suppression.
+ * Greedy argmax over the last position's logits, with token suppression,
+ * frequency-based repetition penalty, and n-gram blocking.
+ * @param {object} logits - ORT tensor with shape [1, seqLen, vocabSize]
+ * @param {number[]} generatedTokens - tokens generated so far
  */
-function greedySample(logits) {
+function greedySample(logits, generatedTokens = []) {
     const data = logits.data;
     const vocabSize = logits.dims[2];
     const seqLen = logits.dims[1];
 
     const offset = (seqLen - 1) * vocabSize;
+
+    // Count token frequencies for frequency-based penalty
+    const tokenCounts = new Map();
+    for (const t of generatedTokens) {
+        tokenCounts.set(t, (tokenCounts.get(t) || 0) + 1);
+    }
+
+    // N-gram blocking: find tokens that would create a repeated 4-gram
+    const blockedTokens = new Set();
+    if (generatedTokens.length >= 3) {
+        const lastTrigram = generatedTokens.slice(-3);
+        // Count how many times this trigram appears in generated tokens
+        for (let i = 0; i <= generatedTokens.length - 4; i++) {
+            if (generatedTokens[i] === lastTrigram[0] &&
+                generatedTokens[i + 1] === lastTrigram[1] &&
+                generatedTokens[i + 2] === lastTrigram[2]) {
+                // The token that followed this trigram before
+                const nextT = generatedTokens[i + 3];
+                // Count occurrences of this 4-gram
+                let count = 0;
+                for (let j = 0; j <= generatedTokens.length - 4; j++) {
+                    if (generatedTokens[j] === lastTrigram[0] &&
+                        generatedTokens[j + 1] === lastTrigram[1] &&
+                        generatedTokens[j + 2] === lastTrigram[2] &&
+                        generatedTokens[j + 3] === nextT) {
+                        count++;
+                    }
+                }
+                if (count >= MAX_NGRAM_REPEAT) {
+                    blockedTokens.add(nextT);
+                }
+            }
+        }
+    }
+
     let maxVal = -Infinity;
     let maxIdx = 0;
 
     for (let i = 0; i < vocabSize; i++) {
         let score = data[offset + i];
+
+        // Suppress specific tokens
         if (SUPPRESSED_TOKENS.includes(i)) {
             score -= SUPPRESSION_PENALTY;
         }
+
+        // N-gram blocking: hard suppress tokens that create repeated 4-grams
+        if (blockedTokens.has(i)) {
+            score -= 100.0;
+        }
+
+        // Frequency-based repetition penalty
+        const count = tokenCounts.get(i) || 0;
+        if (count > 0) {
+            const penalty = Math.pow(REPETITION_PENALTY, count);
+            score = score > 0 ? score / penalty : score * penalty;
+        }
+
         if (score > maxVal) {
             maxVal = score;
             maxIdx = i;
@@ -382,7 +439,45 @@ async function transcribeNoKVCache(speechEmbeddings, promptTokenIds) {
         }
         console.log(`[worker] Decode step ${step + 1}/${maxTokens} (no KV-cache)...`);
         const result = await runDecoder(speechEmbeddings, currentIds, null);
-        const nextToken = greedySample(result.logits);
+
+        // Debug: log top-5 logits for each step
+        {
+            const logits = result.logits;
+            const data = logits.data;
+            const vocabSize = logits.dims[2];
+            const seqLen = logits.dims[1];
+            const offset = (seqLen - 1) * vocabSize;
+
+            if (step === 0) {
+                console.log(`[worker] Logits shape: ${JSON.stringify(logits.dims)}, dtype: ${logits.type}`);
+            }
+
+            // Top-5 tokens
+            const scores = [];
+            for (let i = 0; i < vocabSize; i++) {
+                scores.push({ token: i, score: data[offset + i] });
+            }
+            scores.sort((a, b) => b.score - a.score);
+            const top5 = scores.slice(0, 5).map(s => {
+                const decoded = tokenizer.decode([s.token], { skip_special_tokens: false });
+                return `${s.token}("${decoded}")=${s.score.toFixed(2)}`;
+            });
+            console.log(`[worker] Step ${step + 1} top-5: ${top5.join(", ")}`);
+
+            // Check for NaN/Inf on first step
+            if (step === 0) {
+                let nanCount = 0, infCount = 0;
+                for (let i = 0; i < vocabSize; i++) {
+                    if (isNaN(data[offset + i])) nanCount++;
+                    if (!isFinite(data[offset + i])) infCount++;
+                }
+                if (nanCount > 0 || infCount > 0) {
+                    console.error(`[worker] LOGIT CORRUPTION: NaN=${nanCount}, Inf=${infCount} out of ${vocabSize}`);
+                }
+            }
+        }
+
+        const nextToken = greedySample(result.logits, generatedTokens);
 
         if (nextToken === EOS_TOKEN_ID) {
             console.log(`[worker] EOS at step ${step + 1}`);
@@ -411,9 +506,19 @@ async function transcribeWithKVCache(speechEmbeddings, promptTokenIds) {
 
     // Step 1: Prefill — run full prompt through decoder to get first token + KV cache
     console.log("[worker] Prefill pass (KV-cache mode)...");
+    console.log("[worker] hasKVCacheInputs:", hasKVCacheInputs());
+    console.log("[worker] Decoder inputs:", JSON.stringify(decoderSession.inputNames));
+    console.log("[worker] Decoder outputs:", JSON.stringify(decoderSession.outputNames));
     let result = await runDecoder(speechEmbeddings, promptTokenIds, null);
-    let nextToken = greedySample(result.logits);
+
+    // Log prefill output keys and shapes for debugging
+    for (const [name, tensor] of Object.entries(result)) {
+        console.log(`[worker] Prefill output: ${name} shape=${JSON.stringify(tensor.dims)} dtype=${tensor.type}`);
+    }
+
+    let nextToken = greedySample(result.logits, generatedTokens);
     let pastKeyValues = extractPastKeyValues(result);
+    console.log(`[worker] KV-cache entries: ${Object.keys(pastKeyValues).length}`);
 
     if (nextToken === EOS_TOKEN_ID) {
         console.log("[worker] EOS at prefill");
@@ -438,7 +543,15 @@ async function transcribeWithKVCache(speechEmbeddings, promptTokenIds) {
 
         // Only pass the last generated token (KV cache has the rest)
         result = await runDecoder(speechEmbeddings, [nextToken], pastKeyValues);
-        nextToken = greedySample(result.logits);
+
+        // Log first decode step details for debugging
+        if (step === 1) {
+            for (const [name, tensor] of Object.entries(result)) {
+                console.log(`[worker] Decode step 2 output: ${name} shape=${JSON.stringify(tensor.dims)} dtype=${tensor.type}`);
+            }
+        }
+
+        nextToken = greedySample(result.logits, generatedTokens);
         pastKeyValues = extractPastKeyValues(result);
 
         if (nextToken === EOS_TOKEN_ID) {
@@ -471,8 +584,23 @@ async function transcribe(audioData, promptTemplate, tokenLimit) {
     try {
         // Step 1: Encode speech
         console.log("[worker] Encoding speech...");
+        console.log("[worker] Audio length:", audioData.length, "samples,", (audioData.length / 24000).toFixed(2), "seconds");
         const speechEmbeddings = await encodeSpeech(audioData);
-        console.log("[worker] Speech embeddings shape:", speechEmbeddings.dims);
+        console.log("[worker] Speech embeddings shape:", speechEmbeddings.dims, "dtype:", speechEmbeddings.type);
+
+        // Debug: check speech embedding statistics
+        const embData = speechEmbeddings.data;
+        let min = Infinity, max = -Infinity, sum = 0, nanCount = 0, zeroCount = 0;
+        for (let i = 0; i < embData.length; i++) {
+            const v = embData[i];
+            if (isNaN(v)) { nanCount++; continue; }
+            if (v === 0) zeroCount++;
+            if (v < min) min = v;
+            if (v > max) max = v;
+            sum += v;
+        }
+        const mean = sum / embData.length;
+        console.log(`[worker] Speech embeddings stats: min=${min.toFixed(4)}, max=${max.toFixed(4)}, mean=${mean.toFixed(4)}, NaN=${nanCount}, zeros=${zeroCount}/${embData.length}`);
 
         // Step 2: Prepare prompt tokens
         const audioDuration = (audioData.length / 24000).toFixed(2);
