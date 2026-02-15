@@ -234,24 +234,34 @@ class DecodeWithPastWrapper(nn.Module):
         return (logits, *present_tensors)
 
 
-def _fix_causal_mask_constants(model_proto, traced_seq_len, source_input, source_dim,
-                                add_offset=0):
+def _fix_causal_mask_constants(model_proto, traced_seq_len, source_input=None,
+                                source_dim=None, add_offset=0):
     """Replace hardcoded seq_len constants in causal mask with dynamic computations.
 
     During torch.onnx.export, Qwen2's _update_causal_mask bakes the traced
     seq_len into Constant nodes for Reshape/Equal/Where ops. This function
-    finds those constants and replaces them with dynamic shape computations
-    by extracting a dimension from a specified input tensor.
+    finds those constants and replaces them with dynamic computations.
 
-    Args:
-        model_proto: The ONNX model protobuf.
-        traced_seq_len: The hardcoded value to replace (e.g. 10 for seq_len).
-        source_input: Name of the input tensor to derive dynamic value from
-                      (e.g. "input_ids" or "past_key_values.0.key").
-        source_dim: Which dimension to extract (e.g. 1 for seq_len, 2 for past_len).
-        add_offset: Constant to add to the extracted dim (e.g. 1 for total_len = past_len + 1).
+    Strategy:
+    1. Try to reuse the existing dynamic seq_len already in the graph by
+       tracing backwards from Reshape nodes that consume the hardcoded constants
+       (prefill model — seq_len comes from intermediate Concat output).
+    2. If no Reshape consumer found, fall back to creating Shape(source_input)
+       → Gather(source_dim) nodes (decode model — past_len/total_len from
+       past_key_values shape).
     """
     import numpy as np
+
+    # Build lookup maps
+    output_to_node = {}
+    input_to_consumers = {}
+    for node in model_proto.graph.node:
+        for out in node.output:
+            output_to_node[out] = node
+        for inp in node.input:
+            if inp not in input_to_consumers:
+                input_to_consumers[inp] = []
+            input_to_consumers[inp].append(node)
 
     # Find Constant nodes with hardcoded traced_seq_len
     constants_to_fix = []
@@ -272,45 +282,86 @@ def _fix_causal_mask_constants(model_proto, traced_seq_len, source_input, source
 
     print(f"  Fixing {len(constants_to_fix)} hardcoded seq_len={traced_seq_len} constants")
 
-    # Create Shape → Gather to extract the dynamic dimension from source_input
+    # Find the existing dynamic seq_len by tracing from the Reshape that uses
+    # one of our hardcoded constants:
+    #   Reshape(data=Range_output, shape=hardcoded_constant)
+    #   → Range has limit = Cast(Gather(Shape(intermediate)))
+    #   → We want the Range's limit (before Cast), which is the dynamic seq_len
+    dynamic_scalar = None
     tag = f"_fix_{traced_seq_len}"
-    shape_out = f"{tag}_shape"
-    gather_out = f"{tag}_dim"
-    dim_idx_name = f"{tag}_dim_idx"
 
-    shape_node = helper.make_node(
-        "Shape", inputs=[source_input], outputs=[shape_out],
-        name=f"{tag}/Shape",
-    )
-    dim_idx_init = numpy_helper.from_array(
-        np.array(source_dim, dtype=np.int64), name=dim_idx_name
-    )
-    gather_node = helper.make_node(
-        "Gather", inputs=[shape_out, dim_idx_name], outputs=[gather_out],
-        name=f"{tag}/Gather", axis=0,
-    )
-    model_proto.graph.initializer.append(dim_idx_init)
-    nodes_to_add = [shape_node, gather_node]
+    for const_node, arr in constants_to_fix:
+        const_out = const_node.output[0]
+        for consumer in input_to_consumers.get(const_out, []):
+            if consumer.op_type == "Reshape":
+                # Found Reshape consuming our constant as shape.
+                # The data input should come from a Range node.
+                data_input = consumer.input[0]
+                range_node = output_to_node.get(data_input)
+                if range_node and range_node.op_type == "Range":
+                    # Range(start, limit, step) — limit is the dynamic seq_len
+                    limit_name = range_node.input[1]
+                    # limit typically comes from Cast(Gather(...))
+                    cast_node = output_to_node.get(limit_name)
+                    if cast_node and cast_node.op_type == "Cast":
+                        # The Cast input is the int64 dynamic scalar
+                        dynamic_scalar = cast_node.input[0]
+                    else:
+                        # Maybe limit is directly the dynamic scalar
+                        dynamic_scalar = limit_name
+                    break
+        if dynamic_scalar:
+            break
 
-    # If add_offset > 0, add it to the gathered dimension (e.g. total_len = past_len + 1)
-    dynamic_scalar = gather_out
-    if add_offset != 0:
-        offset_name = f"{tag}_offset"
-        add_out = f"{tag}_added"
-        offset_init = numpy_helper.from_array(
-            np.array(add_offset, dtype=np.int64), name=offset_name
+    if dynamic_scalar is None and source_input is not None and source_dim is not None:
+        # Fallback: create explicit Shape → Gather to extract dim from source_input
+        print(f"  No Reshape consumer found, using explicit Shape({source_input})[{source_dim}]")
+        shape_out = f"{tag}_shape"
+        gather_out = f"{tag}_dim"
+        dim_idx_name = f"{tag}_dim_idx"
+
+        shape_node = helper.make_node(
+            "Shape", inputs=[source_input], outputs=[shape_out],
+            name=f"{tag}/Shape",
         )
-        add_node = helper.make_node(
-            "Add", inputs=[gather_out, offset_name], outputs=[add_out],
-            name=f"{tag}/Add",
+        dim_idx_init = numpy_helper.from_array(
+            np.array(source_dim, dtype=np.int64), name=dim_idx_name
         )
-        model_proto.graph.initializer.append(offset_init)
-        nodes_to_add.append(add_node)
-        dynamic_scalar = add_out
+        gather_node = helper.make_node(
+            "Gather", inputs=[shape_out, dim_idx_name], outputs=[gather_out],
+            name=f"{tag}/Gather", axis=0,
+        )
+        model_proto.graph.initializer.append(dim_idx_init)
+        nodes_to_add_prefix = [shape_node, gather_node]
 
-    # Reshape scalar to [1] tensor for use with Concat
+        dynamic_scalar = gather_out
+        if add_offset != 0:
+            offset_name = f"{tag}_offset"
+            add_out = f"{tag}_added"
+            offset_init = numpy_helper.from_array(
+                np.array(add_offset, dtype=np.int64), name=offset_name
+            )
+            add_node = helper.make_node(
+                "Add", inputs=[gather_out, offset_name], outputs=[add_out],
+                name=f"{tag}/Add",
+            )
+            model_proto.graph.initializer.append(offset_init)
+            nodes_to_add_prefix.append(add_node)
+            dynamic_scalar = add_out
+    else:
+        nodes_to_add_prefix = []
+
+    if dynamic_scalar is None:
+        print("  WARNING: Could not find dynamic seq_len, skipping fixup")
+        return
+
+    print(f"  Using dynamic scalar: {dynamic_scalar}")
+
+    # Reshape the scalar to [1] tensor for use with Concat
     seq_len_1d_name = f"{tag}_1d"
     shape_1_name = f"{tag}_shape_1"
+    nodes_to_add = list(nodes_to_add_prefix)
+
     reshape_node = helper.make_node(
         "Reshape", inputs=[dynamic_scalar, shape_1_name], outputs=[seq_len_1d_name],
         name=f"{tag}/Reshape_1d",
@@ -320,10 +371,6 @@ def _fix_causal_mask_constants(model_proto, traced_seq_len, source_input, source
     )
     model_proto.graph.initializer.append(shape_1_init)
     nodes_to_add.append(reshape_node)
-
-    print(f"  Dynamic source: Shape({source_input})[{source_dim}]"
-          + (f" + {add_offset}" if add_offset else "")
-          + f" → {seq_len_1d_name}")
 
     for i, (const_node, arr) in enumerate(constants_to_fix):
         out_name = const_node.output[0]
@@ -367,9 +414,15 @@ def _fix_causal_mask_constants(model_proto, traced_seq_len, source_input, source
         model_proto.graph.node.remove(const_node)
         print(f"    {const_node.name}: {arr} → dynamic")
 
-    # Insert fixup nodes at the beginning
+    # Insert fixup nodes after the producer of dynamic_scalar (topological order)
+    insert_idx = 0
+    if dynamic_scalar:
+        for i, node in enumerate(model_proto.graph.node):
+            if dynamic_scalar in node.output:
+                insert_idx = i + 1
+                break
     for j, node in enumerate(nodes_to_add):
-        model_proto.graph.node.insert(j, node)
+        model_proto.graph.node.insert(insert_idx + j, node)
 
 
 def export_onnx(model):
@@ -419,8 +472,7 @@ def export_onnx(model):
     # Fix hardcoded causal mask constants before consolidating
     print("  Fixing hardcoded causal mask constants...")
     prefill_proto = onnx.load(str(prefill_path), load_external_data=False)
-    _fix_causal_mask_constants(prefill_proto, traced_seq_len=seq_len,
-                               source_input="input_ids", source_dim=1)
+    _fix_causal_mask_constants(prefill_proto, traced_seq_len=seq_len)
     onnx.save(prefill_proto, str(prefill_path))
     del prefill_proto
 
