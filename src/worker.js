@@ -117,7 +117,7 @@ async function loadModel(config) {
 
         // Load model with transformers.js v4
         // Both modes use decoder_model_merged (it supports KV-cache internally)
-        const encoderDtype = hasShaderF16 ? "fp16" : "q4";
+        const encoderDtype = hasShaderF16 ? "fp16" : "int8";
         console.log(`[worker] Loading model: encoder_model_${encoderDtype} + decoder_model_merged_${dtype} from "${MODEL_ID}"`);
 
         const loadStart = performance.now();

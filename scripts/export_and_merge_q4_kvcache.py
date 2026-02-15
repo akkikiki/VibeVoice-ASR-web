@@ -869,13 +869,16 @@ def _convert_bf16_to_fp32(model):
     return bf16_external_inits
 
 
-def quantize_q4(merged_path):
-    """Quantize merged model to Q4 using MatMulNBits.
+def quantize_q4(merged_path, bits=4):
+    """Quantize merged model using MatMulNBits.
 
+    Args:
+        bits: 4 for Q4 quantization, 8 for INT8 quantization.
     Handles both flat graphs and If-node merged graphs (subgraphs).
     """
+    label = "Q4" if bits == 4 else "INT8"
     print("\n" + "=" * 60)
-    print("Step 4: Quantize to Q4 + reshard")
+    print(f"Step 4: Quantize to {label} + reshard")
     print("=" * 60)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -900,6 +903,8 @@ def quantize_q4(merged_path):
     for sg in subgraphs:
         for init in sg.initializer:
             sg_init_map[init.name] = init
+
+    suffix = "q4" if bits == 4 else "q8"
 
     # Collect MatMul nodes from all subgraphs
     # (subgraph_ref, node, weight_name, weight_idx, activation_input)
@@ -973,29 +978,39 @@ def quantize_q4(merged_path):
 
         # Per-block scales
         block_abs_max = np.max(np.abs(weight_blocks), axis=2)
-        block_scales = (block_abs_max / 7.0).astype(np.float32)
+        qmax = 7.0 if bits == 4 else 127.0
+        block_scales = (block_abs_max / qmax).astype(np.float32)
         block_scales[block_scales == 0] = 1.0
 
         # Quantize
-        q_blocks = np.round(weight_blocks / block_scales[:, :, None]).clip(-8, 7).astype(np.int8)
-        q_unsigned = (q_blocks + 8).astype(np.uint8)
+        qmin, qmax_int = (-8, 7) if bits == 4 else (-128, 127)
+        q_blocks = np.round(weight_blocks / block_scales[:, :, None]).clip(qmin, qmax_int).astype(np.int8)
+        q_unsigned = (q_blocks - qmin).astype(np.uint8)  # shift to unsigned
 
-        # Pack two values per byte
-        packed = np.zeros((N, n_blocks_k, BLOCK_SIZE // 2), dtype=np.uint8)
-        for bi in range(BLOCK_SIZE // 2):
-            packed[:, :, bi] = q_unsigned[:, :, 2 * bi] | (q_unsigned[:, :, 2 * bi + 1] << 4)
+        if bits == 4:
+            # Pack two 4-bit values per byte
+            packed = np.zeros((N, n_blocks_k, BLOCK_SIZE // 2), dtype=np.uint8)
+            for bi in range(BLOCK_SIZE // 2):
+                packed[:, :, bi] = q_unsigned[:, :, 2 * bi] | (q_unsigned[:, :, 2 * bi + 1] << 4)
+            b_data = packed
+        else:
+            # 8-bit: one value per byte, no packing
+            b_data = q_unsigned
 
         # Zero points
-        zp_packed_cols = (n_blocks_k + 1) // 2
-        zp_packed = np.full((N, zp_packed_cols), 0x88, dtype=np.uint8)
+        if bits == 4:
+            zp_packed_cols = (n_blocks_k + 1) // 2
+            zp_data = np.full((N, zp_packed_cols), 0x88, dtype=np.uint8)
+        else:
+            zp_data = np.full((N, n_blocks_k), 128, dtype=np.uint8)
 
-        b_name = f"{weight_name}_q4"
+        b_name = f"{weight_name}_{suffix}"
         scales_name = f"{weight_name}_scales"
         zp_name = f"{weight_name}_zp"
 
-        inits_to_add.append(numpy_helper.from_array(packed, name=b_name))
+        inits_to_add.append(numpy_helper.from_array(b_data, name=b_name))
         inits_to_add.append(numpy_helper.from_array(block_scales, name=scales_name))
-        inits_to_add.append(numpy_helper.from_array(zp_packed, name=zp_name))
+        inits_to_add.append(numpy_helper.from_array(zp_data, name=zp_name))
         inits_to_remove.add(weight_name)
 
         quantized_data[weight_name] = (b_name, scales_name, zp_name, K, N)
@@ -1016,9 +1031,9 @@ def quantize_q4(merged_path):
             "MatMulNBits",
             inputs=[activation_input, b_name, scales_name, zp_name],
             outputs=node.output,
-            name=node.name + "_q4" if node.name else f"matmulnbits_{replace_count}",
+            name=node.name + f"_{suffix}" if node.name else f"matmulnbits_{replace_count}",
             domain="com.microsoft",
-            K=K, N=N, bits=4, block_size=BLOCK_SIZE,
+            K=K, N=N, bits=bits, block_size=BLOCK_SIZE,
         )
 
         # Replace in-place within the subgraph's node list
@@ -1038,7 +1053,8 @@ def quantize_q4(merged_path):
     del model.graph.initializer[:]
     model.graph.initializer.extend(new_inits)
 
-    # Handle embed_tokens -> FP16
+    # Handle embed_tokens -> INT8 (avoids fp16 dependency for WebGPU without shader-f16)
+    # Graph: Gather(int8_embed, ids) -> Cast(fp32) -> Mul(Gather(scales, ids) -> Unsqueeze)
     for init in model.graph.initializer:
         if "embed_tokens" in init.name and init.data_type in (TensorProto.FLOAT, TensorProto.BFLOAT16):
             info = get_external_info(init)
@@ -1053,15 +1069,38 @@ def quantize_q4(merged_path):
                 fp32_arr = (bf16_arr.astype(np.uint32) << 16).view(np.float32)
             else:
                 fp32_arr = np.frombuffer(raw, dtype=np.float32)
-            fp16_data = fp32_arr.astype(np.float16).tobytes()
-            print(f"  embed_tokens: {len(raw)/1e6:.1f} MB -> FP16 {len(fp16_data)/1e6:.1f} MB")
+
+            vocab_size, hidden_dim = list(init.dims)
+            embed_weight = fp32_arr.reshape(vocab_size, hidden_dim)
+
+            # Per-row symmetric int8 quantization
+            row_abs_max = np.max(np.abs(embed_weight), axis=1)  # [vocab_size]
+            row_abs_max[row_abs_max == 0] = 1.0  # avoid div-by-zero
+            embed_scale = (row_abs_max / 127.0).astype(np.float32)  # [vocab_size]
+            embed_int8 = np.round(embed_weight / embed_scale[:, None]).clip(-128, 127).astype(np.int8)
+
+            int8_data = embed_int8.tobytes()
+            scale_data = embed_scale.tobytes()
+            print(f"  embed_tokens: {len(raw)/1e6:.1f} MB -> INT8 {len(int8_data)/1e6:.1f} MB + scales {len(scale_data)/1e6:.2f} MB")
 
             orig_name = init.name
-            fp16_name = init.name + "_fp16"
-            init.name = fp16_name
-            init.data_type = TensorProto.FLOAT16
+            int8_name = orig_name + "_int8"
+            scale_name = orig_name + "_scale"
+            unsqueeze_axes_name = orig_name + "_unsqueeze_axes"
+
+            # Replace the initializer with int8 version
+            init.name = int8_name
+            init.data_type = TensorProto.INT8
             clear_external_data(init)
-            init.raw_data = fp16_data
+            init.raw_data = int8_data
+
+            # Add scale initializer [vocab_size] fp32
+            scale_init = helper.make_tensor(scale_name, TensorProto.FLOAT, [vocab_size], scale_data, raw=True)
+            model.graph.initializer.append(scale_init)
+
+            # Add unsqueeze axes constant [-1]
+            axes_init = helper.make_tensor(unsqueeze_axes_name, TensorProto.INT64, [1], np.array([-1], dtype=np.int64).tobytes(), raw=True)
+            model.graph.initializer.append(axes_init)
 
             # Update Gather nodes in all subgraphs
             for sg in subgraphs:
@@ -1069,15 +1108,45 @@ def quantize_q4(merged_path):
                     if node.op_type == "Gather":
                         for idx, inp in enumerate(node.input):
                             if inp == orig_name:
-                                node.input[idx] = fp16_name
                                 orig_out = node.output[0]
-                                node.output[0] = orig_out + "_fp16"
-                                cast = helper.make_node(
-                                    "Cast", inputs=[orig_out + "_fp16"], outputs=[orig_out],
-                                    name=f"cast_embed_fp16_{sg.name}", to=TensorProto.FLOAT,
+                                # Gather on int8 embed
+                                node.input[idx] = int8_name
+                                int8_out = orig_out + "_int8"
+                                node.output[0] = int8_out
+
+                                # Cast int8 -> fp32
+                                cast_out = orig_out + "_cast"
+                                cast_node = helper.make_node(
+                                    "Cast", inputs=[int8_out], outputs=[cast_out],
+                                    name=f"cast_embed_int8_{sg.name}", to=TensorProto.FLOAT,
                                 )
+
+                                # Gather scales using same indices
+                                ids_input = node.input[1]  # the input_ids
+                                scale_out = orig_out + "_scale"
+                                gather_scale = helper.make_node(
+                                    "Gather", inputs=[scale_name, ids_input], outputs=[scale_out],
+                                    name=f"gather_embed_scale_{sg.name}",
+                                )
+
+                                # Unsqueeze scales: [batch, seq] -> [batch, seq, 1]
+                                unsqueeze_out = orig_out + "_scale_unsq"
+                                unsqueeze_node = helper.make_node(
+                                    "Unsqueeze", inputs=[scale_out, unsqueeze_axes_name], outputs=[unsqueeze_out],
+                                    name=f"unsqueeze_embed_scale_{sg.name}",
+                                )
+
+                                # Mul: fp32_gathered * scales -> fp32 output
+                                mul_node = helper.make_node(
+                                    "Mul", inputs=[cast_out, unsqueeze_out], outputs=[orig_out],
+                                    name=f"mul_embed_dequant_{sg.name}",
+                                )
+
                                 node_idx = list(sg.node).index(node)
-                                sg.node.insert(node_idx + 1, cast)
+                                sg.node.insert(node_idx + 1, cast_node)
+                                sg.node.insert(node_idx + 2, gather_scale)
+                                sg.node.insert(node_idx + 3, unsqueeze_node)
+                                sg.node.insert(node_idx + 4, mul_node)
                                 break
             break
 
@@ -1087,7 +1156,7 @@ def quantize_q4(merged_path):
 
     # Reshard
     print("\n  Resharding...")
-    out_name = "decoder_model_merged_q4.onnx"
+    out_name = f"decoder_model_merged_{label.lower()}.onnx"
     shard_idx = 0
     shard_offset = 0
     shard_file = None
@@ -1196,6 +1265,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--upload", action="store_true")
     parser.add_argument("--skip-export", action="store_true", help="Reuse existing ONNX export")
+    parser.add_argument("--dtype", choices=["q4", "int8"], default="q4", help="Quantization type")
     args = parser.parse_args()
 
     if args.skip_export and (EXPORT_DIR / "decoder_model.onnx").exists():
@@ -1209,8 +1279,10 @@ def main():
         gc.collect()
 
     merged_path = merge_models(prefill_path, decode_path)
-    num_shards = quantize_q4(merged_path)
-    print(f"\n*** Q4 KV-cache merged decoder: {num_shards} shards ***")
+    qbits = 8 if args.dtype == "int8" else 4
+    num_shards = quantize_q4(merged_path, bits=qbits)
+    label = args.dtype.upper()
+    print(f"\n*** {label} KV-cache merged decoder: {num_shards} shards ***")
     print("*** Update Constants.ts with new shard count ***")
 
     if args.upload:
