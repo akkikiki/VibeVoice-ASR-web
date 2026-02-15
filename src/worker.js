@@ -78,6 +78,23 @@ async function loadModel(config) {
 
     try {
         device = "webgpu";
+
+        // Log WebGPU device limits for debugging
+        if (navigator.gpu) {
+            try {
+                const adapter = await navigator.gpu.requestAdapter();
+                if (adapter) {
+                    const adapterInfo = adapter.info || {};
+                    const limits = adapter.limits;
+                    console.log(`[worker] WebGPU adapter: ${adapterInfo.vendor || "unknown"} / ${adapterInfo.architecture || "unknown"} / ${adapterInfo.device || "unknown"}`);
+                    console.log(`[worker] WebGPU maxBufferSize: ${(limits.maxBufferSize / 1024 / 1024).toFixed(0)} MB`);
+                    console.log(`[worker] WebGPU maxStorageBufferBindingSize: ${(limits.maxStorageBufferBindingSize / 1024 / 1024).toFixed(0)} MB`);
+                }
+            } catch (e) {
+                console.warn("[worker] Could not query WebGPU adapter info:", e);
+            }
+        }
+
         console.log(`[worker] Using device: ${device}, decodeMode: ${decodeMode}, dtype: ${dtype}`);
 
         self.postMessage({
@@ -197,12 +214,24 @@ async function loadModel(config) {
         console.error("[worker] Model loading failed:", err);
         console.error("[worker] Error stack:", err?.stack);
 
+        // Try to get GPU memory limit for the error message
+        let gpuLimitInfo = "";
+        try {
+            if (navigator.gpu) {
+                const adapter = await navigator.gpu.requestAdapter();
+                if (adapter) {
+                    const maxBuf = adapter.limits.maxBufferSize;
+                    gpuLimitInfo = ` (device maxBufferSize: ${(maxBuf / 1024 / 1024).toFixed(0)} MB)`;
+                }
+            }
+        } catch (_) { /* ignore */ }
+
         let userMessage;
         if (msg.includes("bad_alloc") || msg.includes("out of memory") || msg.includes("OOM")) {
-            userMessage = `Out of GPU memory (${dtype.toUpperCase()} model). ` +
+            userMessage = `Out of GPU memory loading ${dtype.toUpperCase()} model${gpuLimitInfo}. ` +
                 (dtype !== "q4"
                     ? `Try selecting Q4 quantization (~5.4 GB) instead of ${dtype.toUpperCase()}.`
-                    : `This model requires more GPU memory than your device has available. Try a desktop with a dedicated GPU.`);
+                    : `This 7B-parameter model requires more GPU memory than this device can allocate. Try a desktop computer with 16+ GB RAM.`);
         } else {
             userMessage = `WebGPU model loading failed: ${msg}. ` +
                 `Try using a browser with WebGPU support (Chrome 113+).`;
